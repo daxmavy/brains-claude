@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Per-project mapping (created by `brains.sh init` inside *project* repos, not here)
+.brains
+.venv/
