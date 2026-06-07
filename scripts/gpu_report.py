@@ -31,21 +31,39 @@ def smi(qtype, fields):
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def users_of(pids):
-    out = {}
-    if not pids:
-        return out
-    r = subprocess.run(["ps", "-o", "pid=,uid=", "-p", ",".join(map(str, pids))],
-                       capture_output=True, text=True)
-    for ln in r.stdout.splitlines():
-        f = ln.split()
-        if len(f) >= 2:
-            pid, uid = int(f[0]), int(f[1])
-            try:
-                out[pid] = pwd.getpwuid(uid).pw_name
-            except KeyError:
-                out[pid] = f"uid:{uid}"
-    return out
+def owner_of(pid):
+    """Resolve a pid to a username via /proc — works for containerised / namespaced
+    GPU jobs that `ps -p` silently misses (nvitop/psutil read the same source)."""
+    try:
+        uid = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return "?"
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid:{uid}"
+
+
+def attribute(g):
+    """Credit a GPU's used memory to the owners of the processes on it. nvidia-smi
+    often reports a process's used_gpu_memory as 0 (e.g. containerised jobs) even
+    though the device shows the memory — so the device's used memory is credited to
+    the owners present, not dropped as 'unattributed'. Returns
+    (owner -> MiB dict, genuinely-unattributed MiB)."""
+    per = defaultdict(int)
+    for user, _pid, mem in g["procs"]:
+        per[user] += mem
+    gap = g["used"] - sum(per.values())
+    if gap > 0 and g["procs"]:
+        # under-reported per-process memory: give the gap to owners whose process
+        # reported 0 (the usual cause), else split across all owners on the GPU.
+        zero_owners = sorted({u for u, _p, m in g["procs"] if m == 0})
+        targets = zero_owners or sorted(per)
+        share, extra = divmod(gap, len(targets))
+        for j, u in enumerate(targets):
+            per[u] += share + (extra if j == 0 else 0)
+        gap = 0
+    return per, max(0, gap)
 
 
 def main():
@@ -81,9 +99,8 @@ def main():
             raw.append((uuid2idx[p[0]], int(p[1]), int(p[2])))
         except ValueError:
             continue
-    who = users_of(sorted({pid for _, pid, _ in raw}))
     for idx, pid, mem in raw:
-        gpus[idx]["procs"].append((who.get(pid, "?"), pid, mem))
+        gpus[idx]["procs"].append((owner_of(pid), pid, mem))
 
     def free_mib(g):
         return g["total"] - g["used"]
@@ -97,9 +114,8 @@ def main():
 
     user_gpus, user_mem = defaultdict(set), defaultdict(int)
     for i, g in gpus.items():
-        for user, _pid, mem in g["procs"]:
-            if mem <= 0:           # skip ghost/defunct 0-MiB compute apps
-                continue
+        attrib, _ = attribute(g)
+        for user, mem in attrib.items():
             user_gpus[user].add(i)
             user_mem[user] += mem
 
@@ -115,14 +131,10 @@ def main():
           f"(usable = ≥{args.min_free_mib // 1000}GB free & ≤{args.max_util}% util)")
     for i in sorted(gpus):
         g = gpus[i]
-        per = defaultdict(int)                       # users responsible, mem on THIS gpu
-        for user, _pid, mem in g["procs"]:
-            if mem > 0:
-                per[user] += mem
+        per, gap = attribute(g)
         parts = [f"{u}{' (you)' if u == ME else ''} {m}M"
                  for u, m in sorted(per.items(), key=lambda kv: -kv[1])]
-        gap = g["used"] - sum(per.values())          # held but not attributable to a process
-        if gap > 1024:
+        if gap > 1024:                               # device memory no process accounts for
             parts.append(f"+{gap}M unattributed")
         who = ", ".join(parts) or "—"
         pct = round(100 * g["used"] / g["total"]) if g["total"] else 0
