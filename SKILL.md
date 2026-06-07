@@ -2,7 +2,7 @@
 name: brains
 description: >-
   Run GPU/CPU-heavy work on "Brains", the Oxford OII department GPU server
-  (brains.oii.ox.ac.uk, user shil6647), instead of locally. Use WHENEVER a task
+  (brains.oii.ox.ac.uk), instead of locally. Use WHENEVER a task
   needs a GPU — training, fine-tuning, running or serving an LLM, large-batch or
   accelerated inference, embeddings at scale, any CUDA/PyTorch/vLLM workload — and
   also for SSHing to Brains, checking the Oxford VPN, syncing experiment
@@ -17,7 +17,7 @@ description: >-
 
 # Brains GPU server
 
-Brains is a department GPU box: `ssh shil6647@brains.oii.ox.ac.uk`, reachable
+Brains is a department GPU box: `ssh <username>@brains.oii.ox.ac.uk`, reachable
 **only over the Oxford VPN** (Cisco Secure Client → `vpn.ox.ac.uk`). Hardware:
 2× A100 80GB + 2× L40S, run by **direct execution** (not Slurm). A separate H100
 node `virgil` exists on the same Slurm cluster — **never use Virgil; Brains only.**
@@ -51,9 +51,9 @@ A100). Don't guess high "to be safe" — claim the minimum.
    so "VPN down" (exit 1) is never confused with "Brains unreachable" (exit 2).
    You never run `check` by hand — `brains.sh check`/`vpn` just stay available for
    explicit diagnosis.
-2. **Heavy files live on `/data/shil6647`, never `/home`.** `/home` is ~96% full
-   (24 GB). Repos, data, outputs, venvs, caches all go under `/data/shil6647`.
-3. **Only ever write inside `/data/shil6647`, `/home/shil6647`, or (additively)
+2. **Heavy files live on `/data/<username>`, never `/home`.** `/home` is ~96% full
+   (24 GB). Repos, data, outputs, venvs, caches all go under `/data/<username>`.
+3. **Only ever write inside `/data/<username>`, `/home/<username>`, or (additively)
    the shared HF cache.** Never modify other users' files or system paths.
 4. **Check the shared HuggingFace cache before downloading.** `HF_HOME` is set to
    `/data/resource/huggingface` automatically; use `brains.sh hf-ls <model>` to
@@ -79,7 +79,7 @@ its root (created by `init`, safe to commit). From your local repo root:
 ~/.claude/skills/brains/scripts/brains.sh init <project-name>
 ```
 
-This writes `.brains` (mapping the repo to `/data/shil6647/<project-name>`),
+This writes `.brains` (mapping the repo to `/data/<username>/<project-name>`),
 adds gitignore entries for `data/`/`results/`/`.venv/`, scaffolds
 `pipelines/ analysis/ data/ results/`, and on Brains creates the project dir,
 the `/data` caches, and clones the repo (if it has a GitHub `origin`).
@@ -110,13 +110,13 @@ free GPUs and refuses if too few are free) and `bg` for anything over a minute.
 
 ## Python on Brains
 
-All remote commands run inside the **`daxmavy` conda env** (the skill activates it
+All remote commands run inside the **`<your-env>` conda env** (the skill activates it
 automatically — conda isn't loaded in non-interactive SSH otherwise). Manage
 dependencies with **uv**, which installs into the active conda env:
 - `brains.sh install <pkgs>` — e.g. `brains.sh install 'torch>=2.4' transformers`
 - or inside a job: `uv pip install <pkgs>` then run `python …`
 
-You are free to modify the `daxmavy` env as needed. uv/pip caches go to `/data`.
+You are free to modify the `<your-env>` env as needed. uv/pip caches go to `/data`.
 
 ## Gotchas
 

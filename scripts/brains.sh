@@ -5,7 +5,7 @@
 #   * preflight VPN/reachability gate before any remote action
 #   * remote env is set explicitly (non-interactive SSH does NOT load ~/.bashrc),
 #     pointing HF at the shared cache and redirecting package caches off /home
-#   * heavy files live under /data/shil6647, never the (full) /home
+#   * heavy files live under /data/<username>, never the (full) /home
 #   * code moves by git; data moves by rsync
 #
 # Project mapping is read from a `.brains` file at the repo root (see `init`).
@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---- Defaults: fallbacks if config.sh is absent (overridable by env / .brains) ----
 : "${BRAINS_HOST:=brains.oii.ox.ac.uk}"
 : "${BRAINS_USER:=shil6647}"
-: "${BRAINS_DATA_ROOT:=/data/shil6647}"
+: "${BRAINS_DATA_ROOT:=/data/$BRAINS_USER}"
 : "${BRAINS_HF_HOME:=/data/resource/huggingface}"
 : "${BRAINS_CONDA_BASE:=/opt/anaconda}"   # conda installation on Brains
 : "${BRAINS_CONDA_ENV:=daxmavy}"          # the env ALL remote work runs in (deps via uv)
@@ -432,10 +432,10 @@ Connectivity (no .brains needed):
   gpus                  per-GPU free/busy + who occupies each + per-user totals
   gpu-check <n>         can I get n free GPUs now? names who's blocking if not
   hf-ls [pattern]       list the shared HuggingFace cache (CHECK before downloading)
-  install <pkgs...>     uv pip install into the daxmavy conda env (deps live there)
+  install <pkgs...>     uv pip install into the <your-env> conda env (deps live there)
 
 Per-project (needs a .brains file at the repo root):
-  init <name>           scaffold project: write .brains/.gitignore, make /data/shil6647/<name>, clone repo
+  init <name>           scaffold project: write .brains/.gitignore, make /data/<username>/<name>, clone repo
   config                show the resolved local<->remote mapping
   run [opts] -- <cmd>   run on Brains (foreground). opts: --dir D  --gpus N | --gpu LIST  --allow-all-gpus  --sync
   bg <name> [opts] -- <cmd>   run detached (tmux), survives disconnect; same --gpus/--gpu/--allow-all-gpus opts
@@ -451,13 +451,13 @@ Per-project (needs a .brains file at the repo root):
 
 Preflight: every remote command auto-checks the VPN + reachability first — silent
 when online, and aborts with a VPN-vs-Brains diagnosis when not. No manual `check`.
-Env: every remote command runs in the `daxmavy` conda env (install deps with uv,
+Env: every remote command runs in the `<your-env>` conda env (install deps with uv,
 which targets it); HF shared cache + /data caches + CUDA_DEVICE_ORDER=PCI_BUS_ID
 (so CUDA indices match nvidia-smi) are all set for you automatically.
 GPU policy: request GPUs with --gpus N (or --gpu LIST). The request is refused if
 fewer than N are free (you get a per-user occupancy report), or if it would take
 ALL GPUs — that needs --allow-all-gpus, only after the user explicitly approves.
-Brains GPUs only; never Virgil. Heavy outputs live under /data/shil6647/<name>;
+Brains GPUs only; never Virgil. Heavy outputs live under /data/<username>/<name>;
 models reuse the shared HF cache; all visualisation happens locally.
 EOF
 }

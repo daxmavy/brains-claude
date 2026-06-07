@@ -87,6 +87,6 @@ branch for risky changes; `deploy` pushes the current branch and Brains pulls it
 
 Existing repos are currently cloned in both `/home` and `/data` with `-data`/
 `-db`/`-source` siblings. To converge a project onto this standard, per project:
-move the `/data/shil6647/<project>` clone to be canonical, fold sibling data dirs
+move the `/data/<username>/<project>` clone to be canonical, fold sibling data dirs
 into `data/`/`results/`, `init` it, delete the `/home` clone. Do this
 deliberately, one project at a time — never bulk-move 320 GB unprompted.

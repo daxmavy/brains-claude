@@ -23,7 +23,7 @@ TIMEOUT="${BRAINS_TIMEOUT:-6}"
 vpn_out=$("$HERE/vpn-check.sh"); vpn_rc=$?
 echo "$vpn_out"
 if [[ $vpn_rc -ne 0 ]]; then
-  echo "verdict: OFFLINE — connect the VPN (Cisco Secure Client -> ${BRAINS_VPN_NAME:-your VPN}), then retry."
+  echo "verdict: OFFLINE — connect the VPN (Cisco Secure Client -> ${BRAINS_VPN_NAME:-vpn.ox.ac.uk}), then retry."
   exit 1
 fi
 

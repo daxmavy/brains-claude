@@ -23,19 +23,19 @@ command:
 export HF_HOME=/data/resource/huggingface          # shared cache (read+write)
 export HF_HUB_CACHE=/data/resource/huggingface/hub
 export HF_DATASETS_CACHE=/data/resource/huggingface/datasets
-export UV_CACHE_DIR=/data/shil6647/.cache/uv        # caches OFF /home …
-export PIP_CACHE_DIR=/data/shil6647/.cache/pip
-export TORCH_HOME=/data/shil6647/.cache/torch
-export TRITON_CACHE_DIR=/data/shil6647/.cache/triton
-export XDG_CACHE_HOME=/data/shil6647/.cache         # … catch-all for the rest
+export UV_CACHE_DIR=/data/<username>/.cache/uv        # caches OFF /home …
+export PIP_CACHE_DIR=/data/<username>/.cache/pip
+export TORCH_HOME=/data/<username>/.cache/torch
+export TRITON_CACHE_DIR=/data/<username>/.cache/triton
+export XDG_CACHE_HOME=/data/<username>/.cache         # … catch-all for the rest
 export CUDA_DEVICE_ORDER=PCI_BUS_ID                 # CUDA indices == nvidia-smi (see GPUs)
-source /opt/anaconda/etc/profile.d/conda.sh && conda activate daxmavy   # the work env
+source /opt/anaconda/etc/profile.d/conda.sh && conda activate <your-env>   # the work env
 ```
 
 This single mechanism satisfies several requirements at once: HF reuses the
 **shared cache**; package/model caches are redirected onto `/data` so the nearly
 full `/home` (24 GB free) never fills up; CUDA device numbering is made consistent
-with `nvidia-smi` (see GPUs); and Python runs in the **`daxmavy`** env.
+with `nvidia-smi` (see GPUs); and Python runs in the **`<your-env>`** env.
 
 ## Shared HuggingFace cache
 
@@ -52,20 +52,20 @@ re-download.
 - Gated models still need a HF token in the session
   (`HF_TOKEN` / `huggingface-cli login`); the cache doesn't bypass licensing.
 
-## Python: conda `daxmavy` + uv
+## Python: conda `<your-env>` + uv
 
-Every `brains.sh run` / `bg` / `install` command runs inside the **`daxmavy`**
-conda env (`/opt/anaconda/envs/daxmavy`, Python 3.11) — the skill sources conda
+Every `brains.sh run` / `bg` / `install` command runs inside the **`<your-env>`**
+conda env (`/opt/anaconda/envs/<your-env>`, Python 3.11) — the skill sources conda
 and activates it, since conda isn't loaded in non-interactive SSH. Manage
 dependencies with **uv**, which auto-targets the active conda env:
 
 ```bash
-brains.sh install 'torch>=2.4' transformers      # uv pip install into daxmavy
+brains.sh install 'torch>=2.4' transformers      # uv pip install into <your-env>
 brains.sh run --gpus 1 -- python pipelines/train.py
 ```
 
-You are free to modify the `daxmavy` env. uv/pip caches go to `/data`. There's no
-per-project venv — `daxmavy` is the shared env for all work. (To install inside a
+You are free to modify the `<your-env>` env. uv/pip caches go to `/data`. There's no
+per-project venv — `<your-env>` is the shared env for all work. (To install inside a
 job instead of via `brains.sh install`, just `uv pip install <pkgs>` — uv detects
 the active conda env.)
 
@@ -111,6 +111,6 @@ out of scope). GPUs 0–1 are A100 80GB (often busy); 2–3 are L40S 46GB.
 | `/data` | 9.1 T | ~1.1 T | **everything heavy** |
 
 If a job writes large files, make sure its output path is under
-`/data/shil6647` (the project `results/` already is). Watch out for libraries
+`/data/<username>` (the project `results/` already is). Watch out for libraries
 that default to `~` — the cache env vars above cover the common ones, but check
 new tools.

@@ -23,27 +23,27 @@ a clear interface, with experimental data copied to local by default.
 
 | What | Where |
 |---|---|
-| Project repo on Brains | `/data/shil6647/<project>` (**not** `/home`) |
+| Project repo on Brains | `/data/<username>/<project>` (**not** `/home`) |
 | Project repo on local | anywhere; linked by the `.brains` file at its root |
-| Big data / outputs / venvs / caches on Brains | under `/data/shil6647` |
+| Big data / outputs / venvs / caches on Brains | under `/data/<username>` |
 | Shared HuggingFace cache | `/data/resource/huggingface` (read + additive write) |
-| Per-tool caches on Brains | `/data/shil6647/.cache/{uv,pip,torch,triton}` |
+| Per-tool caches on Brains | `/data/<username>/.cache/{uv,pip,torch,triton}` |
 
-`/home` is ~96% full (24 GB free) and `/home/shil6647` is for dotfiles/config
+`/home` is ~96% full (24 GB free) and `/home/<username>` is for dotfiles/config
 only. `/data` has ~1 TB free. **Never put models, datasets, checkpoints, venvs,
 or caches on `/home`.** (Requirement 2.)
 
 ## Permissions boundary (requirement 3)
 
 Writes are confined to:
-- `/data/shil6647/**` (projects, data, caches) — the primary workspace
-- `/home/shil6647/**` (config/dotfiles only)
+- `/data/<username>/**` (projects, data, caches) — the primary workspace
+- `/home/<username>/**` (config/dotfiles only)
 - `/data/resource/huggingface/**` — **additive only** (new model/dataset
   downloads, which benefit everyone). Never delete or modify others' cached
   entries, and never touch any other user's project dirs or system paths.
 
 `brains.sh` enforces this: every command `cd`s into the project dir under
-`/data/shil6647`, and all caches are redirected there.
+`/data/<username>`, and all caches are redirected there.
 
 ## The `.brains` config
 
@@ -52,8 +52,8 @@ A small shell-sourceable file at the local repo root, created by
 
 ```
 BRAINS_HOST=brains.oii.ox.ac.uk
-BRAINS_USER=shil6647
-BRAINS_REMOTE_DIR=/data/shil6647/<project>
+BRAINS_USER=<username>
+BRAINS_REMOTE_DIR=/data/<username>/<project>
 ```
 
 `brains.sh` walks up from the current directory to find it, so any command works
