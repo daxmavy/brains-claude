@@ -29,6 +29,19 @@ invariants below on every call. Invoke it by absolute path:
 ~/.claude/skills/brains/scripts/brains.sh <command> [args]
 ```
 
+## First-use setup
+
+On a fresh install, confirm setup before the first remote action — the full
+checklist (what to verify, and what only the user can do) is in
+[`reference/setup.md`](reference/setup.md). In brief: `config.sh` holds the user's
+own `BRAINS_USER` + `BRAINS_CONDA_ENV`; passwordless SSH to Brains works; their
+conda env exists; and **GitHub credentials are set up both on the laptop and on
+Brains** — the git code-sync needs auth on both ends and Brains has none by
+default, so `deploy`/`init`/push-from-Brains (and private-repo pulls) fail until a
+key is added on Brains. `brains.sh check` confirms connectivity. A few steps only
+the user can finish — adding an SSH key to GitHub, `ssh-copy-id`, `gh auth login` —
+so guide them rather than assuming.
+
 ## When a task needs a GPU (default behaviour)
 
 GPU/CUDA work does **not** run on this Mac — route it to Brains autonomously:
@@ -136,3 +149,6 @@ You are free to modify the `<your-env>` env as needed. uv/pip caches go to `/dat
   and Brains in sync, run provenance, the gitignore template.
 - `reference/remote-environment.md` — why the env preamble exists (non-interactive
   SSH skips `.bashrc`), the shared HF cache, cache redirection, GPU usage.
+- `reference/setup.md` — first-run setup + the agent checklist (what to verify and
+  what to request from the user): config, passwordless SSH, conda env, and GitHub
+  credentials (local + on Brains).
