@@ -24,6 +24,7 @@ What it handles for you:
   ssh <username>@brains.oii.ox.ac.uk 'conda create -n <your-env> python=3.11 -y'
   ```
 - **GitHub credentials** for the git-based code sync — set up **both on your laptop and on Brains** (Brains has none by default). See [GitHub credentials](#github-credentials-for-the-code-workflow) below.
+- *(Optional, for the Virgil fallback)* the same one-time setup on **Virgil** (`virgil.oii.ox.ac.uk`, 4× H100): `ssh-copy-id <username>@virgil.oii.ox.ac.uk` and `ssh <username>@virgil.oii.ox.ac.uk 'conda create -n <your-env> python=3.11 -y'`. No GitHub setup needed on Virgil.
 
 ## Install
 
@@ -86,9 +87,13 @@ scripts/brains.sh help           # full command list
 
 See [`SKILL.md`](SKILL.md) and [`reference/`](reference/) for the full model: [architecture](reference/architecture.md), [versioning](reference/versioning.md), and the [remote environment](reference/remote-environment.md). Those docs use `<username>`/`<your-env>` as placeholders — the scripts use your real values from `config.sh`.
 
+## Virgil: more GPUs when Brains is full
+
+The skill also knows **Virgil** (`virgil.oii.ox.ac.uk`, 4× H100 80GB). Priority is always **Brains > Virgil**: jobs run on Brains, and only when Brains can't satisfy a `--gpus N` request does the skill fall back to Virgil. On Virgil the sharing rule is stricter — a GPU is used **only if nobody has any process on it at all**, so you can never block or slow someone else's work there. Code reaches Virgil by rsync from your laptop (no GitHub setup needed there); big files live on `/VData/<username>`; `jobs`/`logs`/`stop`/`sync-down` check both hosts automatically. Force it with `--host virgil`, or disable it with `VIRGIL_HOST=""` in `config.sh`.
+
 ## Be a good GPU citizen
 
-Brains is shared. By default the skill treats a GPU as usable only if it has plenty of free memory and low utilisation, and it **will not take all the GPUs at once** without an explicit override. If it can't get what a job needs, it tells you who's using them rather than barging in.
+Brains is shared. By default the skill treats a GPU as usable only if it has plenty of free memory and low utilisation, and it **will not take all the GPUs at once** without an explicit override. If it can't get what a job needs, it tells you who's using them rather than barging in. On **Virgil** the bar is higher still: only completely-idle GPUs are ever used.
 
 ## Security
 

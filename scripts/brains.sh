@@ -28,11 +28,38 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # utilisation — lets us co-locate on lightly-used GPUs. Tunable via env.
 : "${BRAINS_GPU_MIN_FREE_MIB:=40000}"
 : "${BRAINS_GPU_MAX_UTIL:=20}"
+# --- Virgil: second GPU host (4x H100), used as FALLBACK only (Brains > Virgil).
+# Stricter sharing rule there: a GPU is usable ONLY if nobody has any process on
+# it (--exclusive). No /data on Virgil — big disk is /VData. Set VIRGIL_HOST=""
+# to disable Virgil entirely.
+: "${VIRGIL_HOST:=virgil.oii.ox.ac.uk}"
+: "${VIRGIL_DATA_ROOT:=/VData/$BRAINS_USER}"
+: "${VIRGIL_HF_HOME:=/VData/resources/huggingface}"
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 
 err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 info() { printf '%s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
+
+# ---- Compute target: brains (primary) or virgil (fallback) ----
+TARGET=brains
+CUR_HOST="$BRAINS_HOST"; CUR_DATA_ROOT="$BRAINS_DATA_ROOT"; CUR_HF_HOME="$BRAINS_HF_HOME"
+set_target() {  # set_target brains|virgil
+  TARGET="$1"
+  if [[ "$TARGET" == virgil ]]; then
+    [[ -n "$VIRGIL_HOST" ]] || die "Virgil is disabled (VIRGIL_HOST is empty)"
+    CUR_HOST="$VIRGIL_HOST"; CUR_DATA_ROOT="$VIRGIL_DATA_ROOT"; CUR_HF_HOME="$VIRGIL_HF_HOME"
+  else
+    TARGET=brains
+    CUR_HOST="$BRAINS_HOST"; CUR_DATA_ROOT="$BRAINS_DATA_ROOT"; CUR_HF_HOME="$BRAINS_HF_HOME"
+  fi
+}
+# Project dir on the current target. Brains: from .brains (canonical). Virgil:
+# same project name under /VData — code is rsynced there, results sync back.
+cur_remote_dir() {
+  if [[ "$TARGET" == virgil ]]; then printf '%s/%s' "$VIRGIL_DATA_ROOT" "$(basename "$BRAINS_REMOTE_DIR")"
+  else printf '%s' "$BRAINS_REMOTE_DIR"; fi
+}
 
 # ---- Per-project config: walk up from cwd to find `.brains` ----
 BRAINS_PROJECT_ROOT=""
@@ -61,14 +88,14 @@ need_config() {
 # off the 96%-full /home onto /data (req: heavy files on /data).
 remote_env() {
   cat <<EOF
-export HF_HOME='${BRAINS_HF_HOME}'
-export HF_HUB_CACHE='${BRAINS_HF_HOME}/hub'
-export HF_DATASETS_CACHE='${BRAINS_HF_HOME}/datasets'
-export UV_CACHE_DIR='${BRAINS_DATA_ROOT}/.cache/uv'
-export PIP_CACHE_DIR='${BRAINS_DATA_ROOT}/.cache/pip'
-export TORCH_HOME='${BRAINS_DATA_ROOT}/.cache/torch'
-export TRITON_CACHE_DIR='${BRAINS_DATA_ROOT}/.cache/triton'
-export XDG_CACHE_HOME='${BRAINS_DATA_ROOT}/.cache'
+export HF_HOME='${CUR_HF_HOME}'
+export HF_HUB_CACHE='${CUR_HF_HOME}/hub'
+export HF_DATASETS_CACHE='${CUR_HF_HOME}/datasets'
+export UV_CACHE_DIR='${CUR_DATA_ROOT}/.cache/uv'
+export PIP_CACHE_DIR='${CUR_DATA_ROOT}/.cache/pip'
+export TORCH_HOME='${CUR_DATA_ROOT}/.cache/torch'
+export TRITON_CACHE_DIR='${CUR_DATA_ROOT}/.cache/triton'
+export XDG_CACHE_HOME='${CUR_DATA_ROOT}/.cache'
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 mkdir -p "\$UV_CACHE_DIR" "\$PIP_CACHE_DIR" "\$TORCH_HOME" "\$TRITON_CACHE_DIR" 2>/dev/null || true
 # Activate the conda env (conda is NOT loaded in non-interactive SSH). Deps are
@@ -81,7 +108,7 @@ EOF
 }
 
 b64()      { printf '%s' "$1" | base64 | tr -d '\n'; }            # local encode (mac)
-ssh_raw()  { ssh "${SSH_OPTS[@]}" "${BRAINS_USER}@${BRAINS_HOST}" "$@"; }
+ssh_raw()  { ssh "${SSH_OPTS[@]}" "${BRAINS_USER}@${CUR_HOST}" "$@"; }
 
 # Prefer a modern rsync (e.g. Homebrew) over macOS's bundled 2.6.9 if present.
 rsync_bin() {
@@ -114,45 +141,87 @@ ssh_script() {  # ssh_script <script-text>
 # online, and on failure it prints the VPN-vs-Brains diagnosis and aborts with the
 # preflight's exit code (1 = VPN down, 2 = Brains unreachable). Every remote command
 # is wrapped in gated() at dispatch, so this happens for free — no manual `check`.
-_BRAINS_PREFLIGHT_OK=0
-preflight_gate() {
-  [[ "$_BRAINS_PREFLIGHT_OK" == 1 ]] && return 0
+_PREFLIGHT_OK=""   # hosts already verified this invocation
+preflight_gate() {  # preflight_gate [host]
+  local h="${1:-$BRAINS_HOST}"
+  [[ " $_PREFLIGHT_OK " == *" $h "* ]] && return 0
   local out rc
-  out="$("$SCRIPT_DIR/preflight.sh" "$BRAINS_HOST" 2>&1)"; rc=$?
+  out="$("$SCRIPT_DIR/preflight.sh" "$h" 2>&1)"; rc=$?
   if [[ $rc -ne 0 ]]; then printf '%s\n' "$out" >&2; exit "$rc"; fi
-  _BRAINS_PREFLIGHT_OK=1
+  _PREFLIGHT_OK+=" $h"
 }
-gated() { preflight_gate; "$@"; }   # auto-preflight, then run the command
+host_up() { nc -z -G "${BRAINS_TIMEOUT:-6}" "$1" 22 2>/dev/null; }  # quiet probe, no abort
+gated() {  # auto-preflight (on the right host if '--host virgil' was passed), then run
+  local tgt="$BRAINS_HOST" prev=""
+  for a in "$@"; do [[ "$prev" == "--host" && "$a" == v* ]] && tgt="$VIRGIL_HOST"; prev="$a"; done
+  preflight_gate "$tgt"; "$@"
+}
 
-# Run the GPU report / policy checker (gpu_report.py) ON Brains. Extra args are
-# forwarded to it (e.g. --need 2 / --want 2,3 / --allow-all). nvidia-smi on the
-# Brains node only sees Brains' GPUs — Virgil is never touched.
-run_gpu_report() {
-  ssh "${SSH_OPTS[@]}" "${BRAINS_USER}@${BRAINS_HOST}" \
-    "python3 - --min-free-mib $BRAINS_GPU_MIN_FREE_MIB --max-util $BRAINS_GPU_MAX_UTIL $*" \
+# Run the GPU report / policy checker (gpu_report.py) on a host. Policy differs
+# by host: Brains allows sharing lightly-used GPUs; Virgil is --exclusive (a GPU
+# is usable ONLY if nobody has any process on it — never block others' work).
+run_gpu_report() {  # run_gpu_report <brains|virgil> [extra args...]
+  local role="$1"; shift
+  local h="$BRAINS_HOST" flags="--min-free-mib $BRAINS_GPU_MIN_FREE_MIB --max-util $BRAINS_GPU_MAX_UTIL"
+  [[ "$role" == virgil ]] && { h="$VIRGIL_HOST"; flags="--exclusive"; }
+  ssh "${SSH_OPTS[@]}" "${BRAINS_USER}@${h}" "python3 - $flags $*" \
     < "$SCRIPT_DIR/gpu_report.py"
 }
 
-# Resolve a GPU request to a concrete CUDA_VISIBLE_DEVICES list, enforcing the
-# availability check AND the "never occupy ALL GPUs without permission" policy.
-# The full occupancy report (who is using what) is shown to the user on stderr;
-# only the chosen list is returned on stdout. A non-zero return means the request
-# was refused — the report above explains why (insufficient / needs-permission).
-resolve_gpus() {  # resolve_gpus <need|""> <want|""> <allow:0|1>
-  local need="$1" want="$2" allow="$3" pyargs="" report rc
+resolve_gpus_on() {  # <role> <need|""> <want|""> <allow:0|1> — report→stderr, list→stdout
+  local role="$1" need="$2" want="$3" allow="$4" pyargs="" report rc
   [[ -n "$need" ]] && pyargs="--need $need"
   [[ -n "$want" ]] && pyargs="--want $want"
   [[ "$allow" == 1 ]] && pyargs="$pyargs --allow-all"
-  report="$(run_gpu_report $pyargs 2>&1)"; rc=$?
+  report="$(run_gpu_report "$role" $pyargs 2>&1)"; rc=$?
   printf '%s\n' "$report" >&2
   [[ $rc -eq 0 ]] || return $rc
   printf '%s' "$(printf '%s\n' "$report" | sed -n 's/^SELECT=//p' | tail -1)"
 }
 
+# Resolve a GPU request, PRIORITY BRAINS > VIRGIL: try Brains first; if Brains
+# has too few usable GPUs (rc=3), fall back to Virgil under the exclusive rule.
+# Never falls back to dodge needs-permission (rc=4) — taking ALL GPUs of either
+# host still requires the user's explicit OK. Explicit --gpu indices refer to
+# Brains unless --host virgil is given. Sets TARGET to the satisfying host.
+# NB: runs inside $(...) — cannot mutate parent state. Echoes "<host> <gpulist>";
+# the caller does set_target on the first word.
+resolve_gpus() {  # <need|""> <want|""> <allow:0|1> <host-override|"">
+  local need="$1" want="$2" allow="$3" override="${4:-}" gpus rc
+  if [[ "$override" == virgil ]]; then
+    preflight_gate "$VIRGIL_HOST"
+    gpus="$(resolve_gpus_on virgil "$need" "$want" "$allow")" || return $?
+    printf 'virgil %s' "$gpus"; return 0
+  fi
+  gpus="$(resolve_gpus_on brains "$need" "$want" "$allow")"; rc=$?
+  if [[ $rc -eq 0 ]]; then printf 'brains %s' "$gpus"; return 0; fi
+  if [[ $rc -eq 3 && -n "$need" && -n "$VIRGIL_HOST" ]] && host_up "$VIRGIL_HOST"; then
+    info ""
+    info "Brains can't satisfy this — falling back to Virgil (exclusive-GPU rule)…"
+    gpus="$(resolve_gpus_on virgil "$need" "" "$allow")" || return $?
+    printf 'virgil %s' "$gpus"; return 0
+  fi
+  return $rc
+}
+
+# Before running on Virgil: make sure the project code is there and current.
+# Code reaches Virgil by rsync from the laptop (no git clone / GitHub key needed
+# on Virgil); data/results/.venv/.git are excluded. Results sync back via
+# sync-down, which checks both hosts.
+virgil_prepare() {
+  need_config
+  preflight_gate "$VIRGIL_HOST"
+  local dst; dst="$(cur_remote_dir)"
+  ssh_raw "mkdir -p '$dst' '$VIRGIL_DATA_ROOT/.cache'"
+  info "code → virgil: $BRAINS_PROJECT_ROOT -> $dst (excl. .git/data/results/.venv)"
+  do_rsync --exclude .git --exclude data --exclude results --exclude .venv \
+    --exclude __pycache__ "$BRAINS_PROJECT_ROOT/" "${BRAINS_USER}@${VIRGIL_HOST}:$dst/" >/dev/null
+}
+
 # Build the inner runner: env + cd + optional GPU pin + the user command.
 build_runner() {  # build_runner <subdir> <gpu-or-empty> <user-cmd>
-  local subdir="$1" gpu="$2" cmd="$3" wd="$BRAINS_REMOTE_DIR"
-  [[ -n "$subdir" ]] && wd="$BRAINS_REMOTE_DIR/$subdir"
+  local subdir="$1" gpu="$2" cmd="$3" wd; wd="$(cur_remote_dir)"
+  [[ -n "$subdir" ]] && wd="$wd/$subdir"
   printf '#!/usr/bin/env bash\nset -o pipefail\n'   # not -u: conda/user scripts aren't -u clean
   remote_env
   [[ -n "$gpu" ]] && printf "export CUDA_VISIBLE_DEVICES='%s'\n" "$gpu"
@@ -177,16 +246,29 @@ shared HF cache:      $BRAINS_HF_HOME
 EOF
 }
 
-cmd_gpus() {  # full free/busy + per-user occupancy report
-  run_gpu_report
+cmd_gpus() {  # free/busy + per-user occupancy, on BOTH hosts (Brains then Virgil)
+  run_gpu_report brains
+  if [[ -n "$VIRGIL_HOST" ]]; then
+    echo
+    if host_up "$VIRGIL_HOST"; then run_gpu_report virgil
+    else echo "virgil: unreachable (${VIRGIL_HOST}:22) — skipped"; fi
+  fi
 }
 
-cmd_gpu_check() {  # gpu-check <n> [--allow-all-gpus] — can I get n GPUs now?
+cmd_gpu_check() {  # gpu-check <n> [--allow-all-gpus] — Brains first, Virgil fallback
   [[ $# -ge 1 ]] || die "gpu-check: usage: gpu-check <num-gpus> [--allow-all-gpus]"
   local need="$1"; shift
   local allow=""
   [[ "${1:-}" == "--allow-all-gpus" ]] && allow="--allow-all"
-  run_gpu_report --need "$need" $allow
+  run_gpu_report brains --need "$need" $allow && return 0
+  local rc=$?
+  if [[ $rc -eq 3 && -n "$VIRGIL_HOST" ]] && host_up "$VIRGIL_HOST"; then
+    echo
+    echo "Brains can't satisfy this — checking Virgil (exclusive-GPU rule)…"
+    run_gpu_report virgil --need "$need" $allow
+  else
+    return $rc
+  fi
 }
 
 cmd_hf() {  # hf-ls [pattern]
@@ -199,33 +281,39 @@ cmd_hf() {  # hf-ls [pattern]
   fi
 }
 
-cmd_install() {  # install <pkgs...> — uv pip install into the conda env
-  [[ $# -ge 1 ]] || die "install: usage: install <packages...>  (into conda env ${BRAINS_CONDA_ENV} via uv)"
-  info "uv pip install into conda env ${BRAINS_CONDA_ENV}: $*"
+cmd_install() {  # install [--host virgil] <pkgs...> — uv pip install into the conda env
+  if [[ "${1:-}" == "--host" ]]; then set_target "$2"; shift 2; fi
+  [[ $# -ge 1 ]] || die "install: usage: install [--host virgil] <packages...>"
+  info "uv pip install into conda env ${BRAINS_CONDA_ENV} on ${TARGET}: $*"
   ssh_script "$(remote_env)
 uv pip install$(shquote "$@")"
 }
 
-cmd_run() {  # run [--dir D] [--gpus N | --gpu LIST] [--allow-all-gpus] [--sync] -- <cmd...>
+cmd_run() {  # run [--dir D] [--gpus N | --gpu LIST] [--allow-all-gpus] [--host virgil] [--sync] -- <cmd...>
   need_config
-  local subdir="" need="" want="" allow=0 sync=0
+  local subdir="" need="" want="" allow=0 sync=0 hostov=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir)            subdir="$2"; shift 2 ;;
       --gpus)           need="$2";   shift 2 ;;
       --gpu)            want="$2";   shift 2 ;;
       --allow-all-gpus) allow=1;     shift ;;
+      --host)           hostov="$2"; shift 2 ;;
       --sync)           sync=1;      shift ;;
       --)               shift; break ;;
       *) die "run: unknown option '$1' (did you forget '--' before the command?)" ;;
     esac
   done
   [[ $# -gt 0 ]] || die "run: no command given (usage: run [opts] -- <cmd>)"
-  local gpu=""
+  local gpu="" sel
   if [[ -n "$need" || -n "$want" ]]; then
-    gpu="$(resolve_gpus "$need" "$want" "$allow")" || return $?   # refused -> report shown above
-    info "using GPU(s): ${gpu:-none}"
+    sel="$(resolve_gpus "$need" "$want" "$allow" "$hostov")" || return $?  # refused -> report above
+    set_target "${sel%% *}"; gpu="${sel#* }"
+    info "using GPU(s) on ${TARGET}: ${gpu:-none}"
+  elif [[ "$hostov" == virgil ]]; then
+    set_target virgil
   fi
+  [[ "$TARGET" == virgil ]] && virgil_prepare
   ssh_script "$(build_runner "$subdir" "$gpu" "$*")"
   local rc=$?
   [[ $sync -eq 1 ]] && cmd_sync_down results
@@ -237,25 +325,36 @@ cmd_bg() {  # bg <name> [--dir D] [--gpu N|auto] -- <cmd...>
   [[ $# -gt 0 && "$1" != --* ]] || die "bg: first arg must be a job name"
   local name="$1"; shift
   [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "bg: job name must be [A-Za-z0-9_-]"
-  local subdir="" need="" want="" allow=0
+  local subdir="" need="" want="" allow=0 hostov=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir)            subdir="$2"; shift 2 ;;
       --gpus)           need="$2";   shift 2 ;;
       --gpu)            want="$2";   shift 2 ;;
       --allow-all-gpus) allow=1;     shift ;;
+      --host)           hostov="$2"; shift 2 ;;
       --)               shift; break ;;
       *) die "bg: unknown option '$1'" ;;
     esac
   done
   [[ $# -gt 0 ]] || die "bg: no command given"
-  local gpu=""
+  local gpu="" sel
   if [[ -n "$need" || -n "$want" ]]; then
-    gpu="$(resolve_gpus "$need" "$want" "$allow")" || return $?   # refused -> report shown above
-    info "using GPU(s): ${gpu:-none}"
+    sel="$(resolve_gpus "$need" "$want" "$allow" "$hostov")" || return $?  # refused -> report above
+    set_target "${sel%% *}"; gpu="${sel#* }"
+    info "using GPU(s) on ${TARGET}: ${gpu:-none}"
+  elif [[ "$hostov" == virgil ]]; then
+    set_target virgil
   fi
+  [[ "$TARGET" == virgil ]] && virgil_prepare
 
-  local logd="$BRAINS_REMOTE_DIR/results/logs"
+  # provenance: the laptop repo's git state at launch (the remote clone's SHA is
+  # also stamped on Brains; Virgil has no .git — code arrives by rsync)
+  local sha_local dirty_local
+  sha_local=$(git -C "$BRAINS_PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo NA)
+  dirty_local=$(test -n "$(git -C "$BRAINS_PROJECT_ROOT" status --porcelain 2>/dev/null)" && echo yes || echo no)
+
+  local logd; logd="$(cur_remote_dir)/results/logs"
   local runner_enc; runner_enc="$(b64 "$(build_runner "$subdir" "$gpu" "$*")")"
   # Outer launcher: write runner, stamp provenance, start detached (tmux > setsid).
   local launcher
@@ -266,8 +365,9 @@ mkdir -p "\$LOGD"
 echo '$runner_enc' | base64 -d > "\$LOGD/\$NAME.run.sh"
 { echo "name: \$NAME";
   echo "started_utc: \$(date -u +%FT%TZ)";
-  echo "git_sha: \$(git -C '$BRAINS_REMOTE_DIR' rev-parse HEAD 2>/dev/null || echo NA)";
-  echo "git_dirty: \$(test -n "\$(git -C '$BRAINS_REMOTE_DIR' status --porcelain 2>/dev/null)" && echo yes || echo no)";
+  echo "host: ${TARGET}";
+  echo "git_sha: \$(git -C '$(cur_remote_dir)' rev-parse HEAD 2>/dev/null || echo NA)";
+  echo "git_sha_local: ${sha_local} (dirty: ${dirty_local})";
   echo "gpu: ${gpu:-default}"; } > "\$LOGD/\$NAME.meta"
 if command -v tmux >/dev/null 2>&1; then
   tmux new-session -d -s "brains_\$NAME" "bash '\$LOGD/\$NAME.run.sh' > '\$LOGD/\$NAME.log' 2>&1"
@@ -284,38 +384,71 @@ EOF
   info "Monitor:  brains.sh logs $name      Stop: brains.sh stop $name      Pull: brains.sh sync-down"
 }
 
-cmd_jobs() {
-  info "Running Brains jobs (tmux sessions named brains_*):"
-  ssh_raw "tmux ls 2>/dev/null | grep '^brains_' || echo '(none running)'"
+each_host() {  # each_host <fn> — run fn with TARGET set to brains, then virgil (if up)
+  local fn="$1"
+  set_target brains; "$fn"
+  if [[ -n "$VIRGIL_HOST" ]] && host_up "$VIRGIL_HOST"; then
+    set_target virgil; "$fn"; set_target brains
+  fi
 }
 
-cmd_logs() {  # logs <name> [n]
+cmd_jobs() {
+  _list() {
+    info "[$TARGET] jobs (tmux sessions brains_*):"
+    ssh_raw "tmux ls 2>/dev/null | grep '^brains_' || echo '(none running)'"
+  }
+  each_host _list
+}
+
+cmd_logs() {  # logs <name> [n] — finds the job on whichever host it ran
   need_config
   [[ $# -ge 1 ]] || die "logs: usage: logs <name> [lines]"
-  local name="$1" n="${2:-60}"
-  ssh_raw "tail -n '$n' '$BRAINS_REMOTE_DIR/results/logs/$name.log' 2>/dev/null || echo 'no log for $name'"
+  local name="$1" n="${2:-60}" found=0
+  _tail() {
+    [[ $found -eq 1 ]] && return 0
+    local f; f="$(cur_remote_dir)/results/logs/$name.log"
+    if ssh_raw "test -f '$f'"; then
+      info "[$TARGET] $f:"
+      ssh_raw "tail -n '$n' '$f'"; found=1
+    fi
+  }
+  each_host _tail
+  [[ $found -eq 1 ]] || echo "no log for '$name' on Brains or Virgil"
 }
 
-cmd_stop() {  # stop <name>
+cmd_stop() {  # stop <name> — kills the job on whichever host it runs
   need_config
   [[ $# -ge 1 ]] || die "stop: usage: stop <name>"
-  local name="$1" logd="$BRAINS_REMOTE_DIR/results/logs"
-  ssh_script "
-    if tmux has-session -t 'brains_$name' 2>/dev/null; then
-      tmux kill-session -t 'brains_$name'; echo 'killed tmux session brains_$name'
-    elif [[ -f '$logd/$name.pid' ]]; then
-      kill -TERM -- -\$(cat '$logd/$name.pid') 2>/dev/null && echo 'killed pid group' || echo 'pid not running'
-    else echo 'no such job: $name'; fi"
+  local name="$1" stopped=0
+  _kill() {
+    [[ $stopped -eq 1 ]] && return 0
+    local logd out; logd="$(cur_remote_dir)/results/logs"
+    out=$(ssh_script "
+      if tmux has-session -t 'brains_$name' 2>/dev/null; then
+        tmux kill-session -t 'brains_$name'; echo KILLED
+      elif [[ -f '$logd/$name.pid' ]]; then
+        kill -TERM -- -\$(cat '$logd/$name.pid') 2>/dev/null && echo KILLED || echo NOJOB
+      else echo NOJOB; fi")
+    [[ "$out" == *KILLED* ]] && { echo "stopped '$name' on $TARGET"; stopped=1; }
+  }
+  each_host _kill
+  [[ $stopped -eq 1 ]] || echo "no such job '$name' on Brains or Virgil"
 }
 
-cmd_sync_down() {  # sync-down [subdir=results]
+cmd_sync_down() {  # sync-down [subdir=results] — pulls from Brains AND Virgil (if used)
   need_config
   local sub="${1:-results}"
-  local remote="${BRAINS_USER}@${BRAINS_HOST}:${BRAINS_REMOTE_DIR}/${sub}/"
   local local_dir="${BRAINS_PROJECT_ROOT}/${sub}/"
   mkdir -p "$local_dir"
-  info "sync-down: $remote  ->  $local_dir"
-  do_rsync "$remote" "$local_dir"
+  info "sync-down (brains): ${BRAINS_REMOTE_DIR}/${sub}/  ->  $local_dir"
+  do_rsync "${BRAINS_USER}@${BRAINS_HOST}:${BRAINS_REMOTE_DIR}/${sub}/" "$local_dir"
+  if [[ -n "$VIRGIL_HOST" ]] && host_up "$VIRGIL_HOST"; then
+    local vdir="${VIRGIL_DATA_ROOT}/$(basename "$BRAINS_REMOTE_DIR")/${sub}"
+    if ssh "${SSH_OPTS[@]}" "${BRAINS_USER}@${VIRGIL_HOST}" "test -d '$vdir'" 2>/dev/null; then
+      info "sync-down (virgil): ${vdir}/  ->  $local_dir"
+      do_rsync "${BRAINS_USER}@${VIRGIL_HOST}:${vdir}/" "$local_dir"
+    fi
+  fi
 }
 
 cmd_sync_up() {  # sync-up [subdir=data]
@@ -362,10 +495,12 @@ cmd_deploy() {  # push local commits, then pull them on Brains
   ssh_script "export GIT_TERMINAL_PROMPT=0; cd '$BRAINS_REMOTE_DIR' && git pull --ff-only"
 }
 
-cmd_shell() {  # interactive login shell in the project dir
+cmd_shell() {  # shell [virgil] — interactive login shell in the project dir
+  [[ "${1:-}" == virgil ]] && set_target virgil
   load_config || true
-  local cd_to="${BRAINS_REMOTE_DIR:-\$HOME}"
-  exec ssh "${SSH_OPTS[@]}" -t "${BRAINS_USER}@${BRAINS_HOST}" "cd '$cd_to' 2>/dev/null; exec bash -l"
+  local cd_to="\$HOME"
+  [[ -n "$BRAINS_REMOTE_DIR" ]] && cd_to="$(cur_remote_dir)"
+  exec ssh "${SSH_OPTS[@]}" -t "${BRAINS_USER}@${CUR_HOST}" "cd '$cd_to' 2>/dev/null; exec bash -l"
 }
 
 cmd_init() {  # init <project-name>
@@ -429,16 +564,17 @@ brains.sh — interact with the Brains GPU server (direct-exec model)
 Connectivity (no .brains needed):
   check                 explicit VPN + reachability preflight (auto-runs before every remote cmd)
   vpn                   VPN state only (Brains-independent; reads the Cisco client)
-  gpus                  per-GPU free/busy + who occupies each + per-user totals
-  gpu-check <n>         can I get n free GPUs now? names who's blocking if not
+  gpus                  per-GPU free/busy + who occupies each — Brains AND Virgil
+  gpu-check <n>         can I get n GPUs now? Brains first, Virgil fallback; names blockers
   hf-ls [pattern]       list the shared HuggingFace cache (CHECK before downloading)
-  install <pkgs...>     uv pip install into the <your-env> conda env (deps live there)
+  install [--host virgil] <pkgs...>   uv pip install into the conda env on that host
 
 Per-project (needs a .brains file at the repo root):
   init <name>           scaffold project: write .brains/.gitignore, make /data/<username>/<name>, clone repo
   config                show the resolved local<->remote mapping
-  run [opts] -- <cmd>   run on Brains (foreground). opts: --dir D  --gpus N | --gpu LIST  --allow-all-gpus  --sync
-  bg <name> [opts] -- <cmd>   run detached (tmux), survives disconnect; same --gpus/--gpu/--allow-all-gpus opts
+  run [opts] -- <cmd>   run remotely (foreground). opts: --dir D  --gpus N | --gpu LIST
+                        --allow-all-gpus  --host virgil  --sync
+  bg <name> [opts] -- <cmd>   run detached (tmux), survives disconnect; same opts as run
   jobs                  list running background jobs
   logs <name> [n]       tail a background job's log
   stop <name>           stop a background job
@@ -447,18 +583,22 @@ Per-project (needs a .brains file at the repo root):
   get <remote> [local]  fetch one file/dir from Brains (remote rel. to project, or absolute)
   put <local> [remote]  push one file/dir to Brains (only writes under your dirs)
   deploy                git push (local) then git pull (Brains)    ← the code-sync path
-  shell                 interactive login shell in the project dir
+  shell [virgil]        interactive login shell in the project dir
 
 Preflight: every remote command auto-checks the VPN + reachability first — silent
 when online, and aborts with a VPN-vs-Brains diagnosis when not. No manual `check`.
 Env: every remote command runs in the `<your-env>` conda env (install deps with uv,
 which targets it); HF shared cache + /data caches + CUDA_DEVICE_ORDER=PCI_BUS_ID
 (so CUDA indices match nvidia-smi) are all set for you automatically.
-GPU policy: request GPUs with --gpus N (or --gpu LIST). The request is refused if
-fewer than N are free (you get a per-user occupancy report), or if it would take
-ALL GPUs — that needs --allow-all-gpus, only after the user explicitly approves.
-Brains GPUs only; never Virgil. Heavy outputs live under /data/<username>/<name>;
-models reuse the shared HF cache; all visualisation happens locally.
+GPU policy: request GPUs with --gpus N (or --gpu LIST). PRIORITY BRAINS > VIRGIL:
+jobs run on Brains; if Brains can't fill a --gpus N request, the skill falls back
+to Virgil (4x H100), where a GPU is used ONLY if nobody has any process on it —
+never disturb others' work there. A request is refused if too few GPUs are usable
+(you get a per-user occupancy report), or if it would take ALL GPUs of a host —
+that needs --allow-all-gpus, only after the user explicitly approves. Code reaches
+Virgil by rsync from the laptop (git stays Brains-canonical); results come back
+via sync-down, which checks both hosts. Heavy outputs: /data/<username> (Brains),
+/VData/<username> (Virgil); both hosts have a shared HF cache, set automatically.
 EOF
 }
 

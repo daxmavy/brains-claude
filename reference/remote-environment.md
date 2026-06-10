@@ -69,11 +69,12 @@ per-project venv — `<your-env>` is the shared env for all work. (To install in
 job instead of via `brains.sh install`, just `uv pip install <pkgs>` — uv detects
 the active conda env.)
 
-## GPUs (direct execution, shared, Brains-only)
+## GPUs (direct execution, shared, Brains first)
 
-No Slurm gating — you run directly on the Brains node and **share its 4 GPUs with
-other users**. **Never use the Virgil node** (it's on the same Slurm cluster but
-out of scope). GPUs 0–1 are A100 80GB (often busy); 2–3 are L40S 46GB.
+No Slurm gating — you run directly on the node and **share its GPUs with other
+users**. On Brains, GPUs 0–1 are A100 80GB (often busy); 2–3 are L40S 46GB. A
+second host, **Virgil** (4× H100 80GB), serves as automatic fallback — see the
+Virgil section below.
 
 **Always check before claiming, and never monopolise:**
 
@@ -93,6 +94,17 @@ out of scope). GPUs 0–1 are A100 80GB (often busy); 2–3 are L40S 46GB.
 - **Never all of them without permission:** requesting all 4 (`--gpus 4`) is
   refused unless `--allow-all-gpus` is passed — and you pass that *only* after the
   user explicitly approves taking the whole machine.
+- **Virgil fallback (priority Brains > Virgil):** when Brains can't fill a
+  `--gpus N` request, the same request is retried on Virgil under a **stricter
+  rule: a GPU is usable only with NO processes on it at all** (and ~zero
+  memory/util — catches containerised jobs that hide from nvidia-smi). It is
+  critical never to block or slow others' work on Virgil; the tool enforces
+  this — don't work around it. Virgil paths differ: big disk is
+  `/VData/<username>` (no `/data` there; `/` and `/scratch` are nearly full),
+  shared HF cache `/VData/resources/huggingface` — both set automatically. Code
+  reaches Virgil by **rsync from the laptop** (no git/GitHub on Virgil); results
+  come back via `sync-down`, which checks both hosts, as do `jobs`/`logs`/`stop`.
+  Force Virgil with `--host virgil`; disable it with `VIRGIL_HOST=""`.
 - **Index mapping is handled (important):** the preamble exports
   `CUDA_DEVICE_ORDER=PCI_BUS_ID` so CUDA's device indices match `nvidia-smi` (and
   the selector). Without it, CUDA's default `FASTEST_FIRST` order lists the L40S

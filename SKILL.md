@@ -10,8 +10,9 @@ description: >-
   project spanning local + Brains. When a task needs a GPU the agent should
   connect, deploy the repo, write the script, check GPU availability, and run it
   autonomously. Triggers: "needs a GPU", "train/fine-tune/run inference on",
-  "Brains", "the GPU server", "A100/L40S", "ssh to brains", "sync results",
-  "is the VPN on". Enforces: GPU work runs on Brains (never Virgil), the
+  "Brains", "Virgil", "the GPU server", "A100/L40S/H100", "ssh to brains",
+  "sync results", "is the VPN on". Enforces: GPU work runs on Brains first,
+  falling back to Virgil (4x H100) only onto completely-empty GPUs, the
   no-monopoly GPU policy, /data-not-/home, VPN preflight, local/remote split.
 ---
 
@@ -19,8 +20,11 @@ description: >-
 
 Brains is a department GPU box: `ssh <username>@brains.oii.ox.ac.uk`, reachable
 **only over the Oxford VPN** (Cisco Secure Client → `vpn.ox.ac.uk`). Hardware:
-2× A100 80GB + 2× L40S, run by **direct execution** (not Slurm). A separate H100
-node `virgil` exists on the same Slurm cluster — **never use Virgil; Brains only.**
+2× A100 80GB + 2× L40S, run by **direct execution** (not Slurm). A second host,
+**Virgil** (`virgil.oii.ox.ac.uk`, 4× H100 80GB), is used as **automatic
+fallback** when Brains can't satisfy a GPU request — **priority is always
+Brains > Virgil**, and on Virgil a GPU is used **only if nobody has any process
+on it** (see the Virgil section below).
 
 **Everything goes through one CLI** (`scripts/brains.sh`), which guarantees the
 invariants below on every call. Invoke it by absolute path:
@@ -79,9 +83,10 @@ A100). Don't guess high "to be safe" — claim the minimum.
    who's on them (`brains.sh gpus`). Request the **minimum** with `--gpus N`; the
    tool refuses and prints a per-user occupancy report if fewer than N are free —
    when that happens, **tell the user who is occupying the GPUs and how many each
-   holds** instead of proceeding. **Never occupy all GPUs**: that needs
+   holds** instead of proceeding. **Never occupy all GPUs of a host**: that needs
    `--allow-all-gpus`, which you pass *only* after explicitly asking the user and
-   getting approval. **Brains GPUs only — never Virgil.**
+   getting approval. **On Virgil, never touch a GPU that has anyone's process on
+   it** — the tool enforces this (exclusive rule), do not work around it.
 
 ## Per-project setup
 
@@ -130,6 +135,28 @@ dependencies with **uv**, which installs into the active conda env:
 - or inside a job: `uv pip install <pkgs>` then run `python …`
 
 You are free to modify the `<your-env>` env as needed. uv/pip caches go to `/data`.
+
+## Virgil (fallback host)
+
+Virgil = `virgil.oii.ox.ac.uk`, 4× H100 80GB, same Oxford VPN, same username.
+The CLI handles it automatically — same commands, no separate tooling:
+
+- **Priority Brains > Virgil.** A `--gpus N` request resolves on Brains first;
+  only if Brains has too few usable GPUs does it fall back to Virgil. Force it
+  with `--host virgil` (run/bg/install) when explicitly asked to.
+- **Exclusive rule on Virgil:** a GPU counts as usable **only with zero
+  processes on it** (and ~zero memory/util). It is critical not to block or
+  slow anyone's work on Virgil — never co-locate there, never work around the
+  refusal.
+- **Code reaches Virgil by rsync** from the laptop (automatic before each run;
+  no git/GitHub credentials on Virgil needed). Git stays Brains/local-canonical.
+- **Paths differ:** big disk is `/VData/<username>` (NOT `/data`, which doesn't
+  exist there; `/` and `/scratch` are nearly full — never write big files
+  outside `/VData`). Shared HF cache: `/VData/resources/huggingface` — set
+  automatically. Same conda env name, auto-activated.
+- `jobs`/`logs`/`stop`/`sync-down` check **both hosts** — nothing extra to do.
+- One-time setup per user: `ssh-copy-id <username>@virgil.oii.ox.ac.uk` and a
+  conda env there (`conda create -n <your-env> python=3.11 -y`).
 
 ## Gotchas
 
