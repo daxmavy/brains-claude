@@ -167,6 +167,30 @@ The CLI handles it automatically — same commands, no separate tooling:
   sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` in every job so CUDA indices match nvidia-smi
   and the `gpus`/`gpu-check` selector. If you ever run a job *outside* `brains.sh`,
   export `CUDA_DEVICE_ORDER=PCI_BUS_ID` yourself.
+- **GPU-selection race on back-to-back launches:** two `bg --gpus 1` jobs started a
+  few seconds apart can both pick the **same** GPU — the selector reads occupancy
+  before the first model has allocated memory. Launch one, **wait until it occupies
+  its GPU** (poll `nvidia-smi` memory) *then* launch the next, or pin explicitly.
+- **Smoke every new model/host combo tiny first, and confirm a vLLM server actually
+  answers a test completion** — "ready" ≠ "serving". TP=1 single-GPU serving has
+  model-specific failures: big dense models OOM the KV cache at long `max_model_len`
+  (cap it ~8192); Mamba-hybrids (Qwen3.6) need `--max-num-seqs 256`; MXFP4 models
+  (gpt-oss) serve in vLLM but OOM under transformers bf16.
+- **Ports & caches on shared hosts:** a base port (often 8000) may be another user's
+  — probe for a free one, don't hardcode. A model may be in the shared cache *or*
+  your private one (Virgil: `/VData/resources/huggingface` vs `/VData/<username>/hf`)
+  — set `HF_HOME` or pass an explicit `model_path` (+`--served-model-name`).
+- **`data/` is not deployed** (code by git, data by rsync) — sync input files
+  (`--match` params, CSVs) separately or a fresh-cloned job won't find them. The
+  shared `<your-env>` env may also lack a dep (`brains.sh install <pkg>` on `ModuleNotFound`).
+- **Orphaned vLLM after a job "finishes":** an asyncio teardown hang can leave a
+  server pinning a GPU at 100% util doing nothing, stalling any queue behind it —
+  check `pgrep -af vllm.entrypoints` + util vs real progress, and kill the server
+  **and its EngineCore**. For hand-written remote checks use
+  `ssh -o ConnectTimeout=10 -o ServerAliveInterval=5` so a VPN blip fails fast
+  rather than hanging the poll (retry once on a transient exit-255).
+- **Detailed versions of all the above (exact error strings + fixes):**
+  [`reference/gpu-serving-gotchas.md`](reference/gpu-serving-gotchas.md).
 
 ## Reference (read when needed)
 
@@ -179,3 +203,8 @@ The CLI handles it automatically — same commands, no separate tooling:
 - `reference/setup.md` — first-run setup + the agent checklist (what to verify and
   what to request from the user): config, passwordless SSH, conda env, and GitHub
   credentials (local + on Brains).
+- `reference/gpu-serving-gotchas.md` — operational gotchas for running/serving models
+  on the GPUs: the GPU-selection race, per-model TP=1 serving failures (KV-cache OOM,
+  Mamba `max-num-seqs`, MXFP4-vs-transformers), ports/caches on shared hosts, `data/`
+  not deployed, orphaned-vLLM detection, ssh-over-VPN timeouts. Read before a non-trivial
+  serve/run.
