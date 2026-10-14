@@ -1,0 +1,13 @@
+# config.sh — your settings for the Brains GPU server.
+# Set these two to your own, then you're done. Neither is a secret.
+
+export BRAINS_USER="your-username"  # <-- your Brains (Oxford SSO) username
+export BRAINS_CONDA_ENV="your-env"   # <-- your conda env on Brains
+
+# Everything else (host, VPN, /data/<username>, the shared HuggingFace cache) is
+# already set for Brains — see scripts/brains.sh if you ever need to tweak it.
+
+# Virgil (second GPU host, 4x H100) is used as automatic FALLBACK when Brains
+# can't satisfy a GPU request — needs its own one-time `ssh-copy-id
+# <username>@virgil.oii.ox.ac.uk`. Uncomment to disable Virgil entirely:
+# export VIRGIL_HOST=""
