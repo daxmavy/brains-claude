@@ -5,7 +5,7 @@ A [Claude Code](https://docs.claude.com/en/docs/claude-code) **skill** for runni
 What it handles for you:
 
 - **Automatic VPN + reachability check** before every remote action — and it tells *VPN‑down* apart from *Brains‑down* (it reads the VPN client directly, never by probing the server).
-- **GPU etiquette on a shared box** — checks who's on which GPU, reports per‑user usage when it can't get enough, picks the freest, and **never grabs all the GPUs without asking you first**.
+- **Strict GPU etiquette on a shared box** — a GPU is used **only if nobody else has any process on it**; when it can't get enough, it tells you who's using them, and it **never grabs all the GPUs without asking you first**.
 - Keeps heavy files on **`/data`** (not the tiny `/home`), reuses the **shared HuggingFace cache**, and runs in **your conda env** with [`uv`](https://github.com/astral-sh/uv) for packages.
 - **Code travels by git, data by rsync**, with all plotting done locally on synced results. Background jobs survive disconnects; every run records the git commit it ran.
 
@@ -88,7 +88,7 @@ See [`SKILL.md`](SKILL.md) and [`reference/`](reference/) for the full model: [a
 
 ## Be a good GPU citizen
 
-Brains is shared. By default the skill treats a GPU as usable only if it has plenty of free memory and low utilisation, and it **will not take all the GPUs at once** without an explicit override. If it can't get what a job needs, it tells you who's using them rather than barging in.
+Brains is shared. The skill treats a GPU as usable **only if nobody else has any process on it**, so your jobs never slow down someone else's, and it **will not take all the GPUs at once** without an explicit override. If it can't get what a job needs, it tells you who's using them rather than barging in.
 
 ## Security
 

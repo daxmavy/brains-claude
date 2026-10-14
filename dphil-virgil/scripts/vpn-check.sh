@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Is the configured VPN (Cisco Secure Client) connected?
 #
-# Brains-INDEPENDENT by design: this NEVER contacts Brains. It reads only the
+# Virgil-INDEPENDENT by design: this NEVER contacts Virgil. It reads only the
 # local Cisco client state and, as a fallback, the local routing table. That
-# keeps "the VPN is down" cleanly separate from "Brains is unreachable for some
+# keeps "the VPN is down" cleanly separate from "Virgil is unreachable for some
 # other reason" (server down, SSH broken, network issue). Do not determine VPN
-# state by trying to reach Brains.
+# state by trying to reach Virgil.
 #
 # Exit codes:
 #   0  VPN connected
@@ -16,8 +16,8 @@ set -uo pipefail
 _SD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$_SD/../config.sh" ]] && source "$_SD/../config.sh"
 
-CISCO_VPN="${BRAINS_CISCO_VPN:-/opt/cisco/secureclient/bin/vpn}"
-OXFORD_NET="${BRAINS_OXFORD_NET:-163.1}"   # internal IPv4 range your VPN routes (config: BRAINS_OXFORD_NET)
+CISCO_VPN="${VIRGIL_CISCO_VPN:-/opt/cisco/secureclient/bin/vpn}"
+OXFORD_NET="${VIRGIL_OXFORD_NET:-163.1}"   # internal IPv4 range your VPN routes (config: VIRGIL_OXFORD_NET)
 
 # --- Primary signal: Cisco Secure Client's own reported state ---
 if [[ -x "$CISCO_VPN" ]]; then
@@ -31,9 +31,9 @@ if [[ -x "$CISCO_VPN" ]]; then
   esac
 fi
 
-# --- Fallback: routing table (still Brains-independent) ---
+# --- Fallback: routing table (still Virgil-independent) ---
 # A live VPN installs a route into Oxford's internal range via a utun interface.
-# Reading the route table does not touch Brains.
+# Reading the route table does not touch Virgil.
 iface=$(netstat -rn -f inet 2>/dev/null \
   | awk -v n="$OXFORD_NET" '$1 ~ ("^" n "\\.") && $NF ~ /^utun/ {print $NF; exit}')
 if [[ -n "$iface" ]]; then
