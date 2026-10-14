@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Brains GPU status + capacity/policy check. Runs ON Brains (reads nvidia-smi).
+"""GPU status + capacity/policy check. Runs ON the GPU server (reads nvidia-smi).
 
 Reports which GPUs are free vs busy, who is occupying the busy ones and how many
 GPUs each user holds, then decides whether a request for some GPUs is allowed
-under the policy: the agent must NEVER occupy ALL GPUs without explicit
-permission (pass --allow-all only after the user has approved).
+under the policy:
+  * exclusive: a GPU is usable ONLY if nobody has any process on it — never
+    co-locate with other users' work;
+  * the agent must NEVER occupy ALL GPUs without explicit permission (pass
+    --allow-all only after the user has approved).
 
-Usage:  python3 gpu_report.py [--need N | --want i,j] [--allow-all] [--min-free-mib M] [--max-util P]
+Usage:  python3 gpu_report.py [--need N | --want i,j] [--allow-all]
 Exit:   0  ok                (prints "SELECT=i,j" when a request was made)
         3  insufficient       (not enough free GPUs, or a wanted GPU is busy)
         4  needs-permission   (request would occupy ALL GPUs)
@@ -73,13 +76,6 @@ def main():
     g.add_argument("--want", default="", help="explicit GPU indices, e.g. 2,3")
     ap.add_argument("--allow-all", action="store_true",
                     help="permit occupying ALL GPUs (only after user approval)")
-    ap.add_argument("--min-free-mib", type=int, default=40000,
-                    help="a GPU needs at least this much FREE memory to be usable")
-    ap.add_argument("--max-util", type=int, default=20,
-                    help="...and utilisation <= this %% (lets us share lightly-used GPUs)")
-    ap.add_argument("--exclusive", action="store_true",
-                    help="strict rule (Virgil): a GPU is usable ONLY if nobody has any "
-                         "process on it — never co-locate with other users' work")
     args = ap.parse_args()
 
     # --- gather ---
@@ -109,13 +105,10 @@ def main():
         return g["total"] - g["used"]
 
     def is_avail(g):
-        if args.exclusive:
-            # Virgil rule: only completely-empty GPUs. No visible processes, AND
-            # near-zero memory/util (catches containerised jobs whose processes
-            # don't show in nvidia-smi's list) — never disturb others' work.
-            return not g["procs"] and g["used"] <= 1500 and g["util"] <= 5
-        # shared rule (Brains): lightly used — lots of free memory AND low utilisation
-        return free_mib(g) >= args.min_free_mib and g["util"] <= args.max_util
+        # Only completely-empty GPUs: no visible processes, AND near-zero
+        # memory/util (catches containerised jobs whose processes don't show in
+        # nvidia-smi's list) — never disturb others' work.
+        return not g["procs"] and g["used"] <= 1500 and g["util"] <= 5
 
     total = len(gpus)
     avail = sorted((i for i in gpus if is_avail(gpus[i])),
@@ -137,9 +130,7 @@ def main():
         return "█" * f + "░" * (w - f)
 
     host = os.uname().nodename.split(".")[0]
-    policy = ("NO processes on the GPU (exclusive)" if args.exclusive
-              else f"≥{args.min_free_mib // 1000}GB free & ≤{args.max_util}% util")
-    print(f"{host} GPU snapshot — {len(avail)}/{total} usable (usable = {policy})")
+    print(f"{host} GPU snapshot — {len(avail)}/{total} usable (usable = nobody else's process on it)")
     for i in sorted(gpus):
         g = gpus[i]
         per, gap = attribute(g)

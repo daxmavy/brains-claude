@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# virgil.sh — single parameterized CLI for working with the Virgil GPU server.
+#
+# All Virgil interaction goes through here so the invariants hold every time:
+#   * preflight VPN/reachability gate before any remote action
+#   * remote env is set explicitly (non-interactive SSH does NOT load ~/.bashrc),
+#     pointing HF at the shared cache and redirecting package caches off /home
+#   * heavy files live under /VData/<username>, never /home or /scratch
+#   * code is mirrored from the laptop by rsync before every run (no git on Virgil)
+#   * a GPU is used only if nobody else has any process on it
+#
+# Project mapping is read from a `.virgil` file at the repo root (see `init`).
+# Run `virgil.sh help` for the command list.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load site config (username, host, paths, conda env, VPN) if present — see config.sh.
+[[ -f "$SCRIPT_DIR/../config.sh" ]] && source "$SCRIPT_DIR/../config.sh"
+
+# ---- Defaults: fallbacks if config.sh is absent (overridable by env / .virgil) ----
+: "${VIRGIL_HOST:=virgil.oii.ox.ac.uk}"
+: "${VIRGIL_USER:=your-username}"
+: "${VIRGIL_DATA_ROOT:=/VData/$VIRGIL_USER}"
+: "${VIRGIL_HF_HOME:=/VData/resources/huggingface}"
+: "${VIRGIL_CONDA_BASE:=/opt/anaconda}"   # conda installation on Virgil
+: "${VIRGIL_CONDA_ENV:=your-env}"          # the env ALL remote work runs in (deps via uv)
+SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+
+err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+info() { printf '%s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ---- Per-project config: walk up from cwd to find `.virgil` ----
+VIRGIL_PROJECT_ROOT=""
+VIRGIL_REMOTE_DIR=""
+load_config() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.virgil" ]]; then
+      VIRGIL_PROJECT_ROOT="$dir"
+      # shellcheck disable=SC1091
+      source "$dir/.virgil"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+need_config() {
+  load_config || die "No .virgil file found above $PWD. Run 'virgil.sh init <project-name>' in your repo root first."
+  [[ -n "$VIRGIL_REMOTE_DIR" ]] || die ".virgil found at $VIRGIL_PROJECT_ROOT but VIRGIL_REMOTE_DIR is unset."
+}
+
+# ---- Canonical remote environment preamble ----
+# Emitted into EVERY remote command. Non-interactive SSH skips ~/.bashrc, so we
+# set this ourselves: shared HF cache (req: check shared cache) + caches moved
+# off /home onto /VData (req: heavy files on /VData).
+remote_env() {
+  cat <<EOF
+export HF_HOME='${VIRGIL_HF_HOME}'
+export HF_HUB_CACHE='${VIRGIL_HF_HOME}/hub'
+export HF_DATASETS_CACHE='${VIRGIL_HF_HOME}/datasets'
+export UV_CACHE_DIR='${VIRGIL_DATA_ROOT}/.cache/uv'
+export PIP_CACHE_DIR='${VIRGIL_DATA_ROOT}/.cache/pip'
+export TORCH_HOME='${VIRGIL_DATA_ROOT}/.cache/torch'
+export TRITON_CACHE_DIR='${VIRGIL_DATA_ROOT}/.cache/triton'
+export XDG_CACHE_HOME='${VIRGIL_DATA_ROOT}/.cache'
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+mkdir -p "\$UV_CACHE_DIR" "\$PIP_CACHE_DIR" "\$TORCH_HOME" "\$TRITON_CACHE_DIR" 2>/dev/null || true
+# Activate the conda env (conda is NOT loaded in non-interactive SSH). Deps are
+# managed with uv *inside* this env (uv auto-targets the active conda env).
+source '${VIRGIL_CONDA_BASE}/etc/profile.d/conda.sh' 2>/dev/null \\
+  || { echo 'virgil: conda.sh not found at ${VIRGIL_CONDA_BASE}' >&2; exit 1; }
+conda activate '${VIRGIL_CONDA_ENV}' \\
+  || { echo 'virgil: could not activate conda env ${VIRGIL_CONDA_ENV}' >&2; exit 1; }
+EOF
+}
+
+b64()      { printf '%s' "$1" | base64 | tr -d '\n'; }            # local encode (mac)
+ssh_raw()  { ssh "${SSH_OPTS[@]}" "${VIRGIL_USER}@${VIRGIL_HOST}" "$@"; }
+
+# Prefer a modern rsync (e.g. Homebrew) over macOS's bundled 2.6.9 if present.
+rsync_bin() {
+  local c
+  for c in /opt/homebrew/bin/rsync /usr/local/bin/rsync rsync; do
+    command -v "$c" >/dev/null 2>&1 && { echo "$c"; return; }
+  done
+  echo rsync
+}
+# Flags kept compatible with rsync 2.6.9 (no --info=*, no -h).
+do_rsync() { "$(rsync_bin)" -az --partial --stats -e "ssh ${SSH_OPTS[*]}" "$@"; }
+
+# Single-quote args for safe embedding in a remote command string.
+shquote() { local p out=""; for p in "$@"; do p=${p//\'/\'\\\'\'}; out+=" '$p'"; done; printf '%s' "$out"; }
+
+# Resolve a remote path: absolute stays as-is; relative is taken under the
+# project's remote dir (needs a .virgil).
+resolve_remote() {
+  if [[ "$1" == /* ]]; then printf '%s' "$1"; else need_config; printf '%s' "$VIRGIL_REMOTE_DIR/$1"; fi
+}
+
+# Run an arbitrary script string on Virgil, robustly (base64 avoids all quoting
+# pain). Stdout/stderr stream straight back.
+ssh_script() {  # ssh_script <script-text>
+  local enc; enc="$(b64 "$1")"
+  ssh_raw "echo '$enc' | base64 -d | bash"
+}
+
+# Automatic connectivity gate. Runs the preflight ONCE per invocation: silent when
+# online, and on failure it prints the VPN-vs-Virgil diagnosis and aborts with the
+# preflight's exit code (1 = VPN down, 2 = Virgil unreachable). Every remote command
+# is wrapped in gated() at dispatch, so this happens for free — no manual `check`.
+_VIRGIL_PREFLIGHT_OK=0
+preflight_gate() {
+  [[ "$_VIRGIL_PREFLIGHT_OK" == 1 ]] && return 0
+  local out rc
+  out="$("$SCRIPT_DIR/preflight.sh" "$VIRGIL_HOST" 2>&1)"; rc=$?
+  if [[ $rc -ne 0 ]]; then printf '%s\n' "$out" >&2; exit "$rc"; fi
+  _VIRGIL_PREFLIGHT_OK=1
+}
+gated() {   # refuse the unedited example config, then auto-preflight, then run the command
+  [[ "$VIRGIL_USER" == your-username || "$VIRGIL_CONDA_ENV" == your-env ]] \
+    && die "Set VIRGIL_USER and VIRGIL_CONDA_ENV to your own values in $(cd "$SCRIPT_DIR/.." && pwd)/config.sh first."
+  preflight_gate; "$@"
+}
+
+# Run the GPU report / policy checker (gpu_report.py) ON Virgil. Extra args are
+# forwarded to it (e.g. --need 2 / --want 2,3 / --allow-all). The checker treats a
+# GPU as usable ONLY if nobody has any process on it — never co-locate.
+run_gpu_report() {
+  ssh "${SSH_OPTS[@]}" "${VIRGIL_USER}@${VIRGIL_HOST}" \
+    "python3 - $*" \
+    < "$SCRIPT_DIR/gpu_report.py"
+}
+
+# Resolve a GPU request to a concrete CUDA_VISIBLE_DEVICES list, enforcing the
+# availability check AND the "never occupy ALL GPUs without permission" policy.
+# The full occupancy report (who is using what) is shown to the user on stderr;
+# only the chosen list is returned on stdout. A non-zero return means the request
+# was refused — the report above explains why (insufficient / needs-permission).
+resolve_gpus() {  # resolve_gpus <need|""> <want|""> <allow:0|1>
+  local need="$1" want="$2" allow="$3" pyargs="" report rc
+  [[ -n "$need" ]] && pyargs="--need $need"
+  [[ -n "$want" ]] && pyargs="--want $want"
+  [[ "$allow" == 1 ]] && pyargs="$pyargs --allow-all"
+  report="$(run_gpu_report $pyargs 2>&1)"; rc=$?
+  printf '%s\n' "$report" >&2
+  [[ $rc -eq 0 ]] || return $rc
+  printf '%s' "$(printf '%s\n' "$report" | sed -n 's/^SELECT=//p' | tail -1)"
+}
+
+# Mirror the laptop working tree to Virgil (code only). --delete keeps the mirror
+# exact; data/, results/, .git and .venv are excluded, so they are never sent and
+# never deleted on Virgil. Runs automatically before every run/bg.
+mirror_code() {
+  need_config
+  ssh_raw "mkdir -p '$VIRGIL_REMOTE_DIR' '$VIRGIL_DATA_ROOT/.cache'"
+  info "code -> virgil: $VIRGIL_PROJECT_ROOT/ -> $VIRGIL_REMOTE_DIR/ (excl. .git data results .venv)"
+  do_rsync --delete --exclude .git --exclude /data --exclude /results --exclude .venv \
+    --exclude __pycache__ --exclude .ipynb_checkpoints \
+    "$VIRGIL_PROJECT_ROOT/" "${VIRGIL_USER}@${VIRGIL_HOST}:$VIRGIL_REMOTE_DIR/" >/dev/null \
+    || die "code mirror to Virgil failed"
+}
+
+# Build the inner runner: env + cd + optional GPU pin + the user command.
+build_runner() {  # build_runner <subdir> <gpu-or-empty> <user-cmd>
+  local subdir="$1" gpu="$2" cmd="$3" wd="$VIRGIL_REMOTE_DIR"
+  [[ -n "$subdir" ]] && wd="$VIRGIL_REMOTE_DIR/$subdir"
+  printf '#!/usr/bin/env bash\nset -o pipefail\n'   # not -u: conda/user scripts aren't -u clean
+  remote_env
+  [[ -n "$gpu" ]] && printf "export CUDA_VISIBLE_DEVICES='%s'\n" "$gpu"
+  printf "cd '%s' || { echo 'remote dir missing: %s' >&2; exit 1; }\n" "$wd" "$wd"
+  printf '%s\n' "$cmd"
+}
+
+# =====================================================================
+# Subcommands
+# =====================================================================
+
+cmd_check() { exec "$SCRIPT_DIR/preflight.sh" "$VIRGIL_HOST"; }
+cmd_vpn()   { exec "$SCRIPT_DIR/vpn-check.sh"; }
+
+cmd_config() {
+  load_config || die "No .virgil file found above $PWD."
+  cat <<EOF
+project root (local): $VIRGIL_PROJECT_ROOT
+remote host:          ${VIRGIL_USER}@${VIRGIL_HOST}
+remote dir:           $VIRGIL_REMOTE_DIR
+shared HF cache:      $VIRGIL_HF_HOME
+EOF
+}
+
+cmd_gpus() {  # full free/busy + per-user occupancy report
+  run_gpu_report
+}
+
+cmd_gpu_check() {  # gpu-check <n> [--allow-all-gpus] — can I get n GPUs now?
+  [[ $# -ge 1 ]] || die "gpu-check: usage: gpu-check <num-gpus> [--allow-all-gpus]"
+  local need="$1"; shift
+  local allow=""
+  [[ "${1:-}" == "--allow-all-gpus" ]] && allow="--allow-all"
+  run_gpu_report --need "$need" $allow
+}
+
+cmd_hf() {  # hf-ls [pattern]
+  local pat="${1:-}"
+  info "Shared HF hub cache ($VIRGIL_HF_HOME/hub)${pat:+ matching '$pat'}:"
+  if [[ -n "$pat" ]]; then
+    ssh_raw "ls '$VIRGIL_HF_HOME/hub' 2>/dev/null | grep -i -- '$pat' || echo '(no match — not yet cached)'"
+  else
+    ssh_raw "ls '$VIRGIL_HF_HOME/hub' 2>/dev/null | grep -E '^(models|datasets)--' | head -60"
+  fi
+}
+
+cmd_install() {  # install <pkgs...> — uv pip install into the conda env
+  [[ $# -ge 1 ]] || die "install: usage: install <packages...>  (into conda env ${VIRGIL_CONDA_ENV} via uv)"
+  info "uv pip install into conda env ${VIRGIL_CONDA_ENV}: $*"
+  ssh_script "$(remote_env)
+uv pip install$(shquote "$@")"
+}
+
+cmd_run() {  # run [--dir D] [--gpus N | --gpu LIST] [--allow-all-gpus] [--sync] -- <cmd...>
+  need_config
+  local subdir="" need="" want="" allow=0 sync=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir)            subdir="$2"; shift 2 ;;
+      --gpus)           need="$2";   shift 2 ;;
+      --gpu)            want="$2";   shift 2 ;;
+      --allow-all-gpus) allow=1;     shift ;;
+      --sync)           sync=1;      shift ;;
+      --)               shift; break ;;
+      *) die "run: unknown option '$1' (did you forget '--' before the command?)" ;;
+    esac
+  done
+  [[ $# -gt 0 ]] || die "run: no command given (usage: run [opts] -- <cmd>)"
+  local gpu=""
+  if [[ -n "$need" || -n "$want" ]]; then
+    gpu="$(resolve_gpus "$need" "$want" "$allow")" || return $?   # refused -> report shown above
+    info "using GPU(s): ${gpu:-none}"
+  fi
+  mirror_code
+  ssh_script "$(build_runner "$subdir" "$gpu" "$*")"
+  local rc=$?
+  [[ $sync -eq 1 ]] && cmd_sync_down results
+  return $rc
+}
+
+cmd_bg() {  # bg <name> [--dir D] [--gpu N|auto] -- <cmd...>
+  need_config
+  [[ $# -gt 0 && "$1" != --* ]] || die "bg: first arg must be a job name"
+  local name="$1"; shift
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "bg: job name must be [A-Za-z0-9_-]"
+  local subdir="" need="" want="" allow=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir)            subdir="$2"; shift 2 ;;
+      --gpus)           need="$2";   shift 2 ;;
+      --gpu)            want="$2";   shift 2 ;;
+      --allow-all-gpus) allow=1;     shift ;;
+      --)               shift; break ;;
+      *) die "bg: unknown option '$1'" ;;
+    esac
+  done
+  [[ $# -gt 0 ]] || die "bg: no command given"
+  local gpu=""
+  if [[ -n "$need" || -n "$want" ]]; then
+    gpu="$(resolve_gpus "$need" "$want" "$allow")" || return $?   # refused -> report shown above
+    info "using GPU(s): ${gpu:-none}"
+  fi
+  mirror_code
+
+  # provenance: Virgil has no .git (code arrives by rsync), so stamp the laptop's git state
+  local sha_local dirty_local
+  sha_local=$(git -C "$VIRGIL_PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo NA)
+  dirty_local=$(test -n "$(git -C "$VIRGIL_PROJECT_ROOT" status --porcelain 2>/dev/null)" && echo yes || echo no)
+
+  local logd="$VIRGIL_REMOTE_DIR/results/logs"
+  local runner_enc; runner_enc="$(b64 "$(build_runner "$subdir" "$gpu" "$*")")"
+  # Outer launcher: write runner, stamp provenance, start detached (tmux > setsid).
+  local launcher
+  launcher=$(cat <<EOF
+set -uo pipefail
+LOGD='$logd'; NAME='$name'
+mkdir -p "\$LOGD"
+echo '$runner_enc' | base64 -d > "\$LOGD/\$NAME.run.sh"
+{ echo "name: \$NAME";
+  echo "started_utc: \$(date -u +%FT%TZ)";
+  echo "git_sha_local: ${sha_local}";
+  echo "git_dirty_local: ${dirty_local}";
+  echo "gpu: ${gpu:-default}"; } > "\$LOGD/\$NAME.meta"
+if command -v tmux >/dev/null 2>&1; then
+  tmux new-session -d -s "virgil_\$NAME" "bash '\$LOGD/\$NAME.run.sh' > '\$LOGD/\$NAME.log' 2>&1"
+  echo "started: tmux session virgil_\$NAME"
+else
+  setsid bash -c "bash '\$LOGD/\$NAME.run.sh' > '\$LOGD/\$NAME.log' 2>&1" &
+  echo \$! > "\$LOGD/\$NAME.pid"; echo "started: pid \$(cat "\$LOGD/\$NAME.pid")"
+fi
+echo "log: $logd/\$NAME.log"
+EOF
+)
+  ssh_script "$launcher"
+  info ""
+  info "Monitor:  virgil.sh logs $name      Stop: virgil.sh stop $name      Pull: virgil.sh sync-down"
+}
+
+cmd_jobs() {
+  info "Running Virgil jobs (tmux sessions named virgil_*):"
+  ssh_raw "tmux ls 2>/dev/null | grep '^virgil_' || echo '(none running)'"
+}
+
+cmd_logs() {  # logs <name> [n]
+  need_config
+  [[ $# -ge 1 ]] || die "logs: usage: logs <name> [lines]"
+  local name="$1" n="${2:-60}"
+  ssh_raw "tail -n '$n' '$VIRGIL_REMOTE_DIR/results/logs/$name.log' 2>/dev/null || echo 'no log for $name'"
+}
+
+cmd_stop() {  # stop <name>
+  need_config
+  [[ $# -ge 1 ]] || die "stop: usage: stop <name>"
+  local name="$1" logd="$VIRGIL_REMOTE_DIR/results/logs"
+  ssh_script "
+    if tmux has-session -t 'virgil_$name' 2>/dev/null; then
+      tmux kill-session -t 'virgil_$name'; echo 'killed tmux session virgil_$name'
+    elif [[ -f '$logd/$name.pid' ]]; then
+      kill -TERM -- -\$(cat '$logd/$name.pid') 2>/dev/null && echo 'killed pid group' || echo 'pid not running'
+    else echo 'no such job: $name'; fi"
+}
+
+cmd_sync_down() {  # sync-down [subdir=results]
+  need_config
+  local sub="${1:-results}"
+  local remote="${VIRGIL_USER}@${VIRGIL_HOST}:${VIRGIL_REMOTE_DIR}/${sub}/"
+  local local_dir="${VIRGIL_PROJECT_ROOT}/${sub}/"
+  mkdir -p "$local_dir"
+  info "sync-down: $remote  ->  $local_dir"
+  do_rsync "$remote" "$local_dir"
+}
+
+cmd_sync_up() {  # sync-up [subdir=data]
+  need_config
+  local sub="${1:-data}"
+  info "NOTE: code is mirrored automatically by run/bg/deploy; sync-up is for data only."
+  local local_dir="${VIRGIL_PROJECT_ROOT}/${sub}/"
+  local remote="${VIRGIL_USER}@${VIRGIL_HOST}:${VIRGIL_REMOTE_DIR}/${sub}/"
+  [[ -d "$local_dir" ]] || die "sync-up: local $local_dir does not exist"
+  ssh_raw "mkdir -p '$VIRGIL_REMOTE_DIR/$sub'"
+  info "sync-up:   $local_dir  ->  $remote"
+  do_rsync "$local_dir" "$remote"
+}
+
+cmd_get() {  # get <remote> [local] — fetch a single file/dir from Virgil
+  [[ $# -ge 1 ]] || die "get: usage: get <remote-path> [local-path]  (remote: relative to project, or absolute)"
+  local rp lp
+  rp="$(resolve_remote "$1")"
+  lp="${2:-./$(basename "$1")}"
+  mkdir -p "$(dirname "$lp")"
+  info "get: ${VIRGIL_USER}@${VIRGIL_HOST}:$rp  ->  $lp"
+  do_rsync "${VIRGIL_USER}@${VIRGIL_HOST}:$rp" "$lp"
+}
+
+cmd_put() {  # put <local> [remote] — push a single file/dir to Virgil (writes only under your dirs)
+  [[ $# -ge 1 ]] || die "put: usage: put <local-path> [remote-path]  (remote: relative to project, or absolute)"
+  [[ -e "$1" ]] || die "put: local path '$1' does not exist"
+  local lp="$1" rp
+  if [[ $# -ge 2 ]]; then rp="$(resolve_remote "$2")"; else need_config; rp="$VIRGIL_REMOTE_DIR/$(basename "$lp")"; fi
+  case "$rp" in
+    "$VIRGIL_DATA_ROOT"/*|/home/"$VIRGIL_USER"/*) ;;
+    *) die "put: refusing to write outside your dirs ($VIRGIL_DATA_ROOT or /home/$VIRGIL_USER): $rp" ;;
+  esac
+  ssh_raw "mkdir -p '$(dirname "$rp")'"
+  info "put: $lp  ->  ${VIRGIL_USER}@${VIRGIL_HOST}:$rp"
+  do_rsync "$lp" "${VIRGIL_USER}@${VIRGIL_HOST}:$rp"
+}
+
+cmd_deploy() {  # mirror the laptop working tree to Virgil now (run/bg do this anyway)
+  mirror_code
+  info "deployed."
+}
+
+cmd_shell() {  # interactive login shell in the project dir
+  load_config || true
+  local cd_to="${VIRGIL_REMOTE_DIR:-\$HOME}"
+  exec ssh "${SSH_OPTS[@]}" -t "${VIRGIL_USER}@${VIRGIL_HOST}" "cd '$cd_to' 2>/dev/null; exec bash -l"
+}
+
+cmd_init() {  # init <project-name>
+  [[ $# -ge 1 ]] || die "init: usage: init <project-name> (run from your local repo root)"
+  local name="$1"
+  [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] || die "init: name must be [A-Za-z0-9_.-]"
+  local root; root="$(git rev-parse --show-toplevel 2>/dev/null)" \
+    || die "init: not inside a git repo. Create/clone your repo first, then run init from its root."
+  local remote_dir="${VIRGIL_DATA_ROOT}/${name}"
+
+  # 1) local .virgil
+  if [[ -f "$root/.virgil" ]]; then
+    info ".virgil already exists — leaving it untouched."
+  else
+    cat > "$root/.virgil" <<EOF
+# Virgil project mapping (safe to commit — no secrets).
+VIRGIL_HOST=${VIRGIL_HOST}
+VIRGIL_USER=${VIRGIL_USER}
+VIRGIL_REMOTE_DIR=${remote_dir}
+EOF
+    info "wrote $root/.virgil  (remote dir: $remote_dir)"
+  fi
+
+  # 2) gitignore for the big/transient dirs
+  local gi="$root/.gitignore"
+  touch "$gi"
+  local entry
+  for entry in "/data/" "/results/" ".venv/" "__pycache__/" "*.pyc" ".ipynb_checkpoints/"; do
+    grep -qxF "$entry" "$gi" 2>/dev/null || echo "$entry" >> "$gi"
+  done
+  info "ensured .gitignore covers data/, results/, .venv/ …"
+
+  # 3) local scaffold
+  mkdir -p "$root/data" "$root/results" "$root/analysis" "$root/pipelines"
+  [[ -f "$root/results/.gitkeep" ]] || : > "$root/results/.gitkeep"
+
+  # 4) remote: make the project dir + caches, then mirror the code
+  VIRGIL_PROJECT_ROOT="$root"; VIRGIL_REMOTE_DIR="$remote_dir"
+  mirror_code
+  info "remote ready: $remote_dir"
+  info ""
+  info "Done. Commit .virgil + .gitignore, then use: virgil.sh run / bg / sync-down."
+}
+
+cmd_help() {
+  cat <<'EOF'
+virgil.sh — interact with the Virgil GPU server (direct-exec model)
+
+Connectivity (no .virgil needed):
+  check                 explicit VPN + reachability preflight (auto-runs before every remote cmd)
+  vpn                   VPN state only (Virgil-independent; reads the Cisco client)
+  gpus                  per-GPU free/busy + who occupies each + per-user totals
+  gpu-check <n>         can I get n free GPUs now? names who's blocking if not
+  hf-ls [pattern]       list the shared HuggingFace cache (CHECK before downloading)
+  install <pkgs...>     uv pip install into the <your-env> conda env (deps live there)
+
+Per-project (needs a .virgil file at the repo root):
+  init <name>           scaffold project: write .virgil/.gitignore, make /VData/<username>/<name>, mirror code
+  config                show the resolved local<->remote mapping
+  run [opts] -- <cmd>   run on Virgil (foreground). opts: --dir D  --gpus N | --gpu LIST  --allow-all-gpus  --sync
+  bg <name> [opts] -- <cmd>   run detached (tmux), survives disconnect; same --gpus/--gpu/--allow-all-gpus opts
+  jobs                  list running background jobs
+  logs <name> [n]       tail a background job's log
+  stop <name>           stop a background job
+  sync-down [subdir]    rsync remote -> local (default: results/)  ← pull data for local viz
+  sync-up   [subdir]    rsync local -> remote (default: data/)     ← inputs only; code is mirrored by run/bg
+  get <remote> [local]  fetch one file/dir from Virgil (remote rel. to project, or absolute)
+  put <local> [remote]  push one file/dir to Virgil (only writes under your dirs)
+  deploy                mirror the laptop working tree to Virgil now (run/bg do it automatically)
+  shell                 interactive login shell in the project dir
+
+Preflight: every remote command auto-checks the VPN + reachability first — silent
+when online, and aborts with a VPN-vs-Virgil diagnosis when not. No manual `check`.
+Env: every remote command runs in the `<your-env>` conda env (install deps with uv,
+which targets it); HF shared cache + /VData caches + CUDA_DEVICE_ORDER=PCI_BUS_ID
+(so CUDA indices match nvidia-smi) are all set for you automatically.
+GPU policy: request GPUs with --gpus N (or --gpu LIST). A GPU counts as free ONLY
+if nobody has any process on it — never co-locate with someone else's work. The
+request is refused if fewer than N are free (you get a per-user occupancy report),
+or if it would take ALL GPUs — that needs --allow-all-gpus, only after the user
+explicitly approves. Code is never edited on Virgil: the laptop tree is mirrored
+before every run. Heavy outputs live under /VData/<username>/<name>;
+models reuse the shared HF cache; all visualisation happens locally.
+EOF
+}
+
+# =====================================================================
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    # Local / diagnostic — no connectivity needed, so no auto-preflight.
+    check)              cmd_check "$@" ;;
+    vpn)                cmd_vpn "$@" ;;
+    config)             cmd_config "$@" ;;
+    help|-h|--help)     cmd_help ;;
+    # Remote commands — gated() auto-runs the VPN/reachability preflight first.
+    gpus|gpu)           gated cmd_gpus "$@" ;;
+    gpu-check|gpucheck) gated cmd_gpu_check "$@" ;;
+    hf-ls|hf)           gated cmd_hf "$@" ;;
+    install|pip)        gated cmd_install "$@" ;;
+    init)               gated cmd_init "$@" ;;
+    run)                gated cmd_run "$@" ;;
+    bg)                 gated cmd_bg "$@" ;;
+    jobs)               gated cmd_jobs "$@" ;;
+    logs|tail)          gated cmd_logs "$@" ;;
+    stop)               gated cmd_stop "$@" ;;
+    sync-down|down)     gated cmd_sync_down "$@" ;;
+    sync-up|up)         gated cmd_sync_up "$@" ;;
+    get)                gated cmd_get "$@" ;;
+    put)                gated cmd_put "$@" ;;
+    deploy)             gated cmd_deploy "$@" ;;
+    shell|ssh)          gated cmd_shell "$@" ;;
+    *) err "unknown command: $sub"; cmd_help; exit 2 ;;
+  esac
+}
+main "$@"

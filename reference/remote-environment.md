@@ -69,7 +69,7 @@ per-project venv — `<your-env>` is the shared env for all work. (To install in
 job instead of via `brains.sh install`, just `uv pip install <pkgs>` — uv detects
 the active conda env.)
 
-## GPUs (direct execution, shared)
+## GPUs (direct execution, exclusive)
 
 No Slurm gating — you run directly on the Brains node and **share its 4 GPUs with
 other users**. GPUs 0–1 are A100 80GB (often busy); 2–3 are L40S 46GB.
@@ -83,10 +83,9 @@ other users**. GPUs 0–1 are A100 80GB (often busy); 2–3 are L40S 46GB.
   `CUDA_VISIBLE_DEVICES`. If fewer than N are free the request is **refused** with
   the occupancy report — relay to the user *who* is occupying the GPUs and *how
   many* each holds, rather than waiting on or stomping someone's job. A GPU is
-  **usable** if it has plenty of free memory (≥ ~40 GB) and low utilisation
-  (≤ 20%), even if another user has a small process on it — so the agent may share
-  a lightly-used GPU. Size your job to the free memory shown. Tune the thresholds
-  via `BRAINS_GPU_MIN_FREE_MIB` / `BRAINS_GPU_MAX_UTIL`.
+  **usable only if nobody has any process on it** (and its memory/utilisation are
+  near zero, which also catches jobs whose processes don't show in `nvidia-smi`).
+  Never co-locate with someone else's work, and never work around a refusal.
 - **Explicit indices:** `--gpu 2,3` requests those specific GPUs (still checked
   for freeness and policy).
 - **Never all of them without permission:** requesting all 4 (`--gpus 4`) is

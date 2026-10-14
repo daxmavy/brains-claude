@@ -24,10 +24,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BRAINS_HF_HOME:=/data/resource/huggingface}"
 : "${BRAINS_CONDA_BASE:=/opt/anaconda}"   # conda installation on Brains
 : "${BRAINS_CONDA_ENV:=your-env}"          # the env ALL remote work runs in (deps via uv)
-# A GPU is "usable" (shareable) if it has >= this much free memory AND <= this
-# utilisation — lets us co-locate on lightly-used GPUs. Tunable via env.
-: "${BRAINS_GPU_MIN_FREE_MIB:=40000}"
-: "${BRAINS_GPU_MAX_UTIL:=20}"
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 
 err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
@@ -129,10 +125,11 @@ gated() {   # refuse the unedited example config, then auto-preflight, then run 
 }
 
 # Run the GPU report / policy checker (gpu_report.py) ON Brains. Extra args are
-# forwarded to it (e.g. --need 2 / --want 2,3 / --allow-all). nvidia-smi on the
+# forwarded to it (e.g. --need 2 / --want 2,3 / --allow-all). The checker treats a
+# GPU as usable ONLY if nobody has any process on it — never co-locate.
 run_gpu_report() {
   ssh "${SSH_OPTS[@]}" "${BRAINS_USER}@${BRAINS_HOST}" \
-    "python3 - --min-free-mib $BRAINS_GPU_MIN_FREE_MIB --max-util $BRAINS_GPU_MAX_UTIL $*" \
+    "python3 - $*" \
     < "$SCRIPT_DIR/gpu_report.py"
 }
 
@@ -457,7 +454,8 @@ when online, and aborts with a VPN-vs-Brains diagnosis when not. No manual `chec
 Env: every remote command runs in the `<your-env>` conda env (install deps with uv,
 which targets it); HF shared cache + /data caches + CUDA_DEVICE_ORDER=PCI_BUS_ID
 (so CUDA indices match nvidia-smi) are all set for you automatically.
-GPU policy: request GPUs with --gpus N (or --gpu LIST). The request is refused if
+GPU policy: request GPUs with --gpus N (or --gpu LIST). A GPU counts as free ONLY
+if nobody has any process on it — never co-locate. The request is refused if
 fewer than N are free (you get a per-user occupancy report), or if it would take
 ALL GPUs — that needs --allow-all-gpus, only after the user explicitly approves.
 Heavy outputs live under /data/<username>/<name>;

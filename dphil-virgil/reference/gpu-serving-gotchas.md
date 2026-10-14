@@ -1,10 +1,10 @@
-# GPU jobs & model serving on Brains/Virgil — gotchas
+# GPU jobs & model serving on Virgil — gotchas
 
-Hard-won operational gotchas for running/serving models on Brains (2×A100 + 2×L40S)
-and Virgil (4×H100). All observed in practice; each has a concrete fix.
+Hard-won operational gotchas for running/serving models on Virgil (4×H100 80GB).
+All observed in practice; each has a concrete fix.
 
 ## GPU-selection race on back-to-back launches
-`brains.sh bg --gpus N` picks GPUs by reading **current** occupancy. A model takes
+`virgil.sh bg --gpus N` picks GPUs by reading **current** occupancy. A model takes
 tens of seconds to load before it allocates GPU memory — so two bg jobs launched a
 few seconds apart both read the same GPU as free and **land on it together** →
 OOM/contention. (Observed: two perplexity jobs both reported "using GPU 0".)
@@ -12,11 +12,11 @@ OOM/contention. (Observed: two perplexity jobs both reported "using GPU 0".)
 Fix: launch the first job, **wait until it actually occupies its GPU** before
 launching the next, so the selector sees it busy and picks a different one:
 ```bash
-brains.sh bg job1 --host virgil --gpus 1 -- '<cmd model A>'
+virgil.sh bg job1 --gpus 1 -- '<cmd model A>'
 # wait (remotely, so a flaky local ssh can't hang the gate) until GPU0 is taken:
-brains.sh run --host virgil --gpus 0 -- \
+virgil.sh run --gpus 0 -- \
   'for i in $(seq 1 30); do m=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0); [ "${m:-0}" -gt 5000 ] && break; sleep 5; done; echo "GPU0=${m}MiB"'
-brains.sh bg job2 --host virgil --gpus 1 -- '<cmd model B>'   # now picks GPU1
+virgil.sh bg job2 --gpus 1 -- '<cmd model B>'   # now picks GPU1
 ```
 Alternatively pin explicitly with `CUDA_VISIBLE_DEVICES` (remember
 `CUDA_DEVICE_ORDER=PCI_BUS_ID`).
@@ -49,24 +49,24 @@ one from a base, or pick a high base (8200+) and verify it's free first
 (`ss -ltn | grep :PORT`). If `ss`/`netstat` can't show you the PID, the holder is
 another user — pick a different port, don't kill it.
 
-## Model cache locations differ (especially Virgil)
-The shared cache and your private cache are different directories. On Virgil,
-gemma/qwen live under `/VData/resources/huggingface`, but a model you downloaded
-yourself (e.g. gpt-oss) may be under `/VData/<username>/hf/hub`. Point `HF_HOME` at the
+## Model cache locations differ
+The shared cache and your private cache are different directories. The shared cache
+is `/VData/resources/huggingface`, but a model you downloaded yourself may sit in a
+private cache under `/VData/<username>`. Point `HF_HOME` at the
 cache that holds the model, **or** pass an explicit `model_path` (with
 `--served-model-name` so the served API id stays clean and there's no hub
-re-download). `brains.sh hf-ls <name>` checks the shared cache. (Brains shared cache
-is `/data/resource/huggingface`, set via `HF_HOME` automatically by the skill.)
+re-download). `virgil.sh hf-ls <name>` checks the shared cache, which the skill sets as
+`HF_HOME` automatically.
 
-## `data/` is NOT deployed — only code travels by git
-`deploy` pushes **code only** (`data/` and `results/` are gitignored). Any input a
+## `data/` is NOT mirrored — only code is
+The code mirror (`run`/`bg`/`deploy`) sends **code only**; `data/` and `results/` are excluded. Any input a
 remote job reads — a `--match params.json`, a prepared CSV — must be synced
 separately (`sync-up`, `put`, or `scp`). A job that can't find `data/...` right after
-a fresh clone/deploy is almost always this.
+a fresh mirror is almost always this.
 
 ## The shared conda env may lack a project dep
 The `<your-env>` env is shared and may be missing a Python dep your code needs
-(observed: `retrying`). On `ModuleNotFoundError`, `brains.sh install <pkg>` (or
+(observed: `retrying`). On `ModuleNotFoundError`, `virgil.sh install <pkg>` (or
 `uv pip install` into the active env) and re-run. You're free to modify the env.
 
 ## Orphaned vLLM after a job "finishes"
@@ -79,26 +79,25 @@ plus GPU util vs actual row/checkpoint growth; kill the orphaned server **and it
 `EngineCore` child** to free the GPU. (Prevent it in code by closing the async client
 in-loop and force-exiting after results are persisted.)
 
-## ssh to Brains/Virgil can hang on a VPN blip
+## ssh to Virgil can hang on a VPN blip
 A bare `ssh host "..."` inside a poll loop can **block indefinitely** on a stalled TCP
 connection (flaky VPN), freezing the loop so it never sees completion. Always use
 `ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2` for
 hand-written remote checks so a blip fails fast and the loop retries; on a transient
 exit-255, just retry. For long waits, prefer a scheduled self-wakeup over a
-long-lived poll. (`brains.sh` subcommands already wrap ssh sanely — this is for raw
+long-lived poll. (`virgil.sh` subcommands already wrap ssh sanely — this is for raw
 ssh you write yourself.)
 
 ## Verify a serve actually works before a long run
 A vLLM server reaching "ready" (health endpoint) is not proof it serves usefully —
 boot can succeed and the first real request stall, or the model id can mismatch.
 Before committing to a multi-hour run, send one test completion (`/v1/chat/completions`)
-and confirm a sane response. Smoke EVERY new model/host combination tiny first
+and confirm a sane response. Smoke EVERY new model tiny first
 (a few docs/props) — the failure modes above all surface in a 2-minute smoke.
 
-## Virgil vs Brains policy
-- **Virgil = 4×H100, exclusive mode**: a GPU with ANY other user's process is
-  off-limits. Leave ≥1 H100 free; **never `--allow-all-gpus` on Virgil**. vLLM in the
-  `<your-env>` env needs the **cu129 wheel** (CUDA minor-version driver compat) — see the
-  setup script; the stock cu130 wheel fails with `libcudart.so.13`.
-- **Brains**: may use all 4 GPUs, but only with explicit user approval
+## GPU policy
+- A GPU with **any** other user's process on it is off-limits — never co-locate.
+- Prefer GPUs 1–3 when you have a free choice: GPU 0 is set aside as a pilot device
+  in the cluster's configuration.
+- Virgil may use all 4 GPUs, but only with explicit user approval
   (`--allow-all-gpus`). Never monopolise by default.

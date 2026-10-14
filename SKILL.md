@@ -74,7 +74,9 @@ A100). Don't guess high "to be safe" — claim the minimum.
 5. **Code travels by git; data travels by rsync.** One repo cloned both sides.
    Never commit `data/`/`results/`. Pull results to local for **all
    visualisation** — viz happens locally so you can iterate without Brains.
-6. **GPU policy — check first, never monopolise.** Before claiming GPUs, check
+6. **GPU policy — only completely-free GPUs, never monopolise.** A GPU counts as
+   usable **only if nobody has any process on it**; never co-locate with someone
+   else's work, and never work around a refusal. Before claiming GPUs, check
    who's on them (`brains.sh gpus`). Request the **minimum** with `--gpus N`; the
    tool refuses and prints a per-user occupancy report if fewer than N are free —
    when that happens, **tell the user who is occupying the GPUs and how many each
