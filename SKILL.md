@@ -10,9 +10,8 @@ description: >-
   project spanning local + Brains. When a task needs a GPU the agent should
   connect, deploy the repo, write the script, check GPU availability, and run it
   autonomously. Triggers: "needs a GPU", "train/fine-tune/run inference on",
-  "Brains", "Virgil", "the GPU server", "A100/L40S/H100", "ssh to brains",
-  "sync results", "is the VPN on". Enforces: GPU work runs on Brains first,
-  falling back to Virgil (4x H100) only onto completely-empty GPUs, the
+  "Brains", "the GPU server", "A100/L40S", "ssh to brains", "sync results",
+  "is the VPN on". Enforces: GPU work runs on Brains, the
   no-monopoly GPU policy, /data-not-/home, VPN preflight, local/remote split.
 ---
 
@@ -20,11 +19,7 @@ description: >-
 
 Brains is a department GPU box: `ssh <username>@brains.oii.ox.ac.uk`, reachable
 **only over the Oxford VPN** (Cisco Secure Client → `vpn.ox.ac.uk`). Hardware:
-2× A100 80GB + 2× L40S, run by **direct execution** (not Slurm). A second host,
-**Virgil** (`virgil.oii.ox.ac.uk`, 4× H100 80GB), is used as **automatic
-fallback** when Brains can't satisfy a GPU request — **priority is always
-Brains > Virgil**, and on Virgil a GPU is used **only if nobody has any process
-on it** (see the Virgil section below).
+2× A100 80GB + 2× L40S, run by **direct execution** (not Slurm).
 
 **Everything goes through one CLI** (`scripts/brains.sh`), which guarantees the
 invariants below on every call. Invoke it by absolute path:
@@ -83,10 +78,9 @@ A100). Don't guess high "to be safe" — claim the minimum.
    who's on them (`brains.sh gpus`). Request the **minimum** with `--gpus N`; the
    tool refuses and prints a per-user occupancy report if fewer than N are free —
    when that happens, **tell the user who is occupying the GPUs and how many each
-   holds** instead of proceeding. **Never occupy all GPUs of a host**: that needs
+   holds** instead of proceeding. **Never occupy all GPUs**: that needs
    `--allow-all-gpus`, which you pass *only* after explicitly asking the user and
-   getting approval. **On Virgil, never touch a GPU that has anyone's process on
-   it** — the tool enforces this (exclusive rule), do not work around it.
+   getting approval.
 
 ## Per-project setup
 
@@ -136,28 +130,6 @@ dependencies with **uv**, which installs into the active conda env:
 
 You are free to modify the `<your-env>` env as needed. uv/pip caches go to `/data`.
 
-## Virgil (fallback host)
-
-Virgil = `virgil.oii.ox.ac.uk`, 4× H100 80GB, same Oxford VPN, same username.
-The CLI handles it automatically — same commands, no separate tooling:
-
-- **Priority Brains > Virgil.** A `--gpus N` request resolves on Brains first;
-  only if Brains has too few usable GPUs does it fall back to Virgil. Force it
-  with `--host virgil` (run/bg/install) when explicitly asked to.
-- **Exclusive rule on Virgil:** a GPU counts as usable **only with zero
-  processes on it** (and ~zero memory/util). It is critical not to block or
-  slow anyone's work on Virgil — never co-locate there, never work around the
-  refusal.
-- **Code reaches Virgil by rsync** from the laptop (automatic before each run;
-  no git/GitHub credentials on Virgil needed). Git stays Brains/local-canonical.
-- **Paths differ:** big disk is `/VData/<username>` (NOT `/data`, which doesn't
-  exist there; `/` and `/scratch` are nearly full — never write big files
-  outside `/VData`). Shared HF cache: `/VData/resources/huggingface` — set
-  automatically. Same conda env name, auto-activated.
-- `jobs`/`logs`/`stop`/`sync-down` check **both hosts** — nothing extra to do.
-- One-time setup per user: `ssh-copy-id <username>@virgil.oii.ox.ac.uk` and a
-  conda env there (`conda create -n <your-env> python=3.11 -y`).
-
 ## Gotchas
 
 - **GPU index mapping (handled — but know it):** CUDA's default device order
@@ -171,18 +143,18 @@ The CLI handles it automatically — same commands, no separate tooling:
   few seconds apart can both pick the **same** GPU — the selector reads occupancy
   before the first model has allocated memory. Launch one, **wait until it occupies
   its GPU** (poll `nvidia-smi` memory) *then* launch the next, or pin explicitly.
-- **Smoke every new model/host combo tiny first, and confirm a vLLM server actually
-  answers a test completion** — "ready" ≠ "serving". TP=1 single-GPU serving has
+- **Smoke every new model tiny first, and confirm a vLLM server actually answers a
+  test completion** — "ready" ≠ "serving". TP=1 single-GPU serving has
   model-specific failures: big dense models OOM the KV cache at long `max_model_len`
   (cap it ~8192); Mamba-hybrids (Qwen3.6) need `--max-num-seqs 256`; MXFP4 models
   (gpt-oss) serve in vLLM but OOM under transformers bf16.
-- **Ports & caches on shared hosts:** a base port (often 8000) may be another user's
+- **Ports & caches on a shared host:** a base port (often 8000) may be another user's
   — probe for a free one, don't hardcode. A model may be in the shared cache *or*
-  your private one (Virgil: `/VData/resources/huggingface` vs `/VData/<username>/hf`)
-  — set `HF_HOME` or pass an explicit `model_path` (+`--served-model-name`).
+  your private one — set `HF_HOME` or pass an explicit `model_path`
+  (+`--served-model-name`).
 - **`data/` is not deployed** (code by git, data by rsync) — sync input files
-  (`--match` params, CSVs) separately or a fresh-cloned job won't find them. The
-  shared `<your-env>` env may also lack a dep (`brains.sh install <pkg>` on `ModuleNotFound`).
+  (`--match` params, CSVs) separately or a fresh-cloned job won't find them. Your
+  `<your-env>` env may also lack a dep (`brains.sh install <pkg>` on `ModuleNotFound`).
 - **Orphaned vLLM after a job "finishes":** an asyncio teardown hang can leave a
   server pinning a GPU at 100% util doing nothing, stalling any queue behind it —
   check `pgrep -af vllm.entrypoints` + util vs real progress, and kill the server
@@ -205,6 +177,6 @@ The CLI handles it automatically — same commands, no separate tooling:
   credentials (local + on Brains).
 - `reference/gpu-serving-gotchas.md` — operational gotchas for running/serving models
   on the GPUs: the GPU-selection race, per-model TP=1 serving failures (KV-cache OOM,
-  Mamba `max-num-seqs`, MXFP4-vs-transformers), ports/caches on shared hosts, `data/`
+  Mamba `max-num-seqs`, MXFP4-vs-transformers), ports/caches on a shared host, `data/`
   not deployed, orphaned-vLLM detection, ssh-over-VPN timeouts. Read before a non-trivial
   serve/run.

@@ -23,22 +23,16 @@ GitHub SSH key on Brains, write `~/.ssh/config`, set `url.insteadOf`, run
 
 | # | Check | Verify with | If missing |
 |---|---|---|---|
-| 1 | `config.sh` is the user's own | values aren't the committed example (`shil6647` / `daxmavy`) | ask for their Brains username + conda env; write them into `config.sh` |
+| 1 | `config.sh` is the user's own | values aren't the committed example (`your-username` / `your-env`) | ask for their Brains username + conda env; write them into `config.sh` |
 | 2 | VPN + Brains reachable | `scripts/brains.sh check` → `ONLINE` | ask them to connect the Oxford VPN (Cisco Secure Client) |
 | 3 | Passwordless SSH to Brains | `ssh -o BatchMode=yes <user>@brains.oii.ox.ac.uk echo ok` prints `ok` | ask them to run `ssh-copy-id <user>@brains.oii.ox.ac.uk` |
 | 4 | Conda env exists on Brains | `ssh <host> 'conda env list' \| grep -w <env>` | offer to create it: `conda create -n <env> python=3.11 -y` |
 | 5 | GitHub auth — **local** | `gh auth status` (or `ssh -T git@github.com` → "Hi …") | `gh auth login`, or add an SSH key (`ssh-keygen` → paste `.pub` at github.com/settings/ssh/new) |
 | 6 | GitHub auth — **on Brains** | `ssh <host> 'ssh -T git@github.com'` → "Hi …" | set up a key on Brains (README → *GitHub credentials*), then **request the user add the printed public key to GitHub** |
 
-| 7 | *(optional)* Virgil fallback: passwordless SSH | `ssh -o BatchMode=yes <user>@virgil.oii.ox.ac.uk echo ok` | ask them to run `ssh-copy-id <user>@virgil.oii.ox.ac.uk` (password prompt — only they can) |
-| 8 | *(optional)* Virgil: conda env exists | `ssh <virgil> 'conda env list' \| grep -w <env>` | offer to create it: `conda create -n <env> python=3.11 -y` |
-
 After **1–4**, the compute side works (`run`/`bg`/`sync-*`/`gpus`/`install`).
 Items **5–6** are needed only for the **git code-sync** (`init` cloning, `deploy`,
-editing-on-Brains-and-pushing-back). Items **7–8** enable the **Virgil fallback**
-(more GPUs when Brains is full); without them the skill still works, Brains-only —
-set `VIRGIL_HOST=""` in `config.sh` to silence Virgil entirely. Virgil needs **no
-GitHub credentials** (code reaches it by rsync from the laptop).
+editing-on-Brains-and-pushing-back).
 
 ## Why GitHub auth is needed on BOTH ends
 
