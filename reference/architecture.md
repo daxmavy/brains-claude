@@ -7,36 +7,35 @@
    ─────────────────                        ───────────────────────────
    • all visualisation / plotting           • all GPU/CPU-heavy compute
    • notebooks, analysis, writing           • training / inference / sims
-   • git source of truth (push)             • git working copy (pull, run)
+   • canonical code (git lives here)        • code mirror (rsynced, never edited)
    • results/ (synced FROM Brains)          • results/ (written here)
    • data/ subset (optional)               • data/ (full datasets)
 
-            code  ──────── git (GitHub) ────────►  code
+            code  ──────── rsync mirror ────────►  code
             data  ◄─────── rsync (brains.sh) ─────  results
 ```
 
 Heavy work runs on Brains; its outputs are pulled to local so analysis and
-figures can be iterated **without** a Brains connection. This is requirement 5:
-a clear interface, with experimental data copied to local by default.
+figures can be iterated **without** a Brains connection.
 
 ## Canonical locations
 
 | What | Where |
 |---|---|
-| Project repo on Brains | `/data/<username>/<project>` (**not** `/home`) |
+| Project dir on Brains | `/data/<username>/<project>` (**not** `/home`) |
 | Project repo on local | anywhere; linked by the `.brains` file at its root |
-| Big data / outputs / venvs / caches on Brains | under `/data/<username>` |
+| Big data / outputs / envs / caches on Brains | under `/data/<username>` |
 | Shared HuggingFace cache | `/data/resource/huggingface` (read + additive write) |
 | Per-tool caches on Brains | `/data/<username>/.cache/{uv,pip,torch,triton}` |
 
-`/home` is ~96% full (24 GB free) and `/home/<username>` is for dotfiles/config
-only. `/data` has ~1 TB free. **Never put models, datasets, checkpoints, venvs,
-or caches on `/home`.** (Requirement 2.)
+`/home` is nearly full and `/home/<username>` is for dotfiles/config only. **Never
+put models, datasets, checkpoints, venvs or caches there.** Check `df -h /data`
+before anything large.
 
-## Permissions boundary (requirement 3)
+## Permissions boundary
 
 Writes are confined to:
-- `/data/<username>/**` (projects, data, caches) — the primary workspace
+- `/data/<username>/**` (projects, data, envs, caches) — the primary workspace
 - `/home/<username>/**` (config/dotfiles only)
 - `/data/resource/huggingface/**` — **additive only** (new model/dataset
   downloads, which benefit everyone). Never delete or modify others' cached
@@ -60,7 +59,7 @@ BRAINS_REMOTE_DIR=/data/<username>/<project>
 from anywhere inside the repo. The local repo root is wherever this file lives —
 that is how local repos are allowed to be anywhere on the Mac.
 
-## Standard project layout (same on both sides)
+## Standard project layout
 
 ```
 <project>/
@@ -82,5 +81,5 @@ that is how local repos are allowed to be anywhere on the Mac.
   to the local `results/`. `run --sync` does this automatically after a job.
 - **Inputs:** put raw data in `data/` on Brains (it stays there; it's big). If
   you generate inputs locally, `brains.sh sync-up data` pushes them.
-- **Code:** never via rsync — always git (`brains.sh deploy`). See
-  `versioning.md`.
+- **Code:** mirrored from the laptop automatically before every `run`/`bg`
+  (or now, with `brains.sh deploy`). See `versioning.md`.

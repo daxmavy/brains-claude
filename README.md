@@ -7,7 +7,7 @@ What it handles for you:
 - **Automatic VPN + reachability check** before every remote action — and it tells *VPN‑down* apart from *Brains‑down* (it reads the VPN client directly, never by probing the server).
 - **Strict GPU etiquette on a shared box** — a GPU is used **only if nobody else has any process on it**; when it can't get enough, it tells you who's using them, and it **never grabs all the GPUs without asking you first**.
 - Keeps heavy files on **`/data`** (not the tiny `/home`), reuses the **shared HuggingFace cache**, and runs in **your conda env** with [`uv`](https://github.com/astral-sh/uv) for packages.
-- **Code travels by git, data by rsync**, with all plotting done locally on synced results. Background jobs survive disconnects; every run records the git commit it ran.
+- **Your laptop holds the code.** Before every run it mirrors your working tree to Brains, so a job never runs stale code and Brains needs no GitHub setup. Results come back by rsync for plotting locally. Background jobs survive disconnects; every run records the git commit it ran.
 
 ## Requirements
 
@@ -21,9 +21,9 @@ What it handles for you:
   ```
 - A **conda env on Brains** to run in — make one once:
   ```bash
-  ssh <username>@brains.oii.ox.ac.uk 'conda create -n <your-env> python=3.11 -y'
+  ssh <username>@brains.oii.ox.ac.uk \
+    'source /opt/anaconda/etc/profile.d/conda.sh && conda create -n <your-env> python=3.11 -y'
   ```
-- **GitHub credentials** for the git-based code sync — set up **both on your laptop and on Brains** (Brains has none by default). See [GitHub credentials](#github-credentials-for-the-code-workflow) below.
 
 ## Install
 
@@ -44,29 +44,6 @@ export BRAINS_CONDA_ENV="your-env"   # the conda env you created on Brains
 ```
 
 That's everything — the host, VPN, your `/data/<username>` workspace, and the shared HuggingFace cache are already set for Brains.
-
-## GitHub credentials (for the code workflow)
-
-The skill moves **code by git** and **data by rsync**, so git must authenticate to GitHub on **both** ends — your laptop *and* Brains. Public repos can be *read* on Brains without this, but **pushing from Brains and using private repos require it**.
-
-**On your laptop** — you probably have this already. Check with `gh auth status` (or `ssh -T git@github.com`). If not: run `gh auth login`, or add an SSH key — `ssh-keygen -t ed25519`, then paste `~/.ssh/id_ed25519.pub` at <https://github.com/settings/ssh/new>.
-
-**On Brains** — Brains has **no** GitHub credentials by default. Give it a dedicated SSH key (one-time). SSH in (`ssh <username>@brains.oii.ox.ac.uk`), then run:
-
-```bash
-ssh-keygen -t ed25519 -f ~/.ssh/github_ed25519 -N "" -C "$USER@brains-github"
-printf '\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile ~/.ssh/github_ed25519\n  IdentitiesOnly yes\n' >> ~/.ssh/config && chmod 600 ~/.ssh/config
-git config --global url."git@github.com:".insteadOf "https://github.com/"   # route HTTPS remotes through the key
-cat ~/.ssh/github_ed25519.pub                                              # copy this line
-```
-
-Add the printed key at <https://github.com/settings/ssh/new> (type **Authentication Key**), then verify from Brains:
-
-```bash
-ssh -T -o StrictHostKeyChecking=accept-new git@github.com   # expect: Hi <you>! You've successfully authenticated
-```
-
-It's an account-level key (works for all your repos), passphraseless so non-interactive git works, and protected by file permissions in `~/.ssh` on Brains — revoke it on GitHub anytime. (Claude can run all of this for you **except** adding the key to GitHub — that step needs you.)
 
 ## Using it
 
