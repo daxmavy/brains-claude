@@ -8,7 +8,7 @@ description: >-
   also for SSHing to Brains, checking the Oxford VPN, syncing experiment
   data/results to this Mac, reusing the shared HuggingFace cache, or setting up a
   project spanning local + Brains. When a task needs a GPU the agent should
-  connect, deploy the repo, write the script, check GPU availability, and run it
+  connect, mirror the repo, write the script, check GPU availability, and run it
   autonomously. Triggers: "needs a GPU", "train/fine-tune/run inference on",
   "Brains", "the GPU server", "A100/L40S", "ssh to brains", "sync results",
   "is the VPN on". Enforces: GPU work runs on Brains, the
@@ -34,19 +34,17 @@ On a fresh install, confirm setup before the first remote action — the full
 checklist (what to verify, and what only the user can do) is in
 [`reference/setup.md`](reference/setup.md). In brief: `config.sh` holds the user's
 own `BRAINS_USER` + `BRAINS_CONDA_ENV`; passwordless SSH to Brains works; their
-conda env exists; and **GitHub credentials are set up both on the laptop and on
-Brains** — the git code-sync needs auth on both ends and Brains has none by
-default, so `deploy`/`init`/push-from-Brains (and private-repo pulls) fail until a
-key is added on Brains. `brains.sh check` confirms connectivity. A few steps only
-the user can finish — adding an SSH key to GitHub, `ssh-copy-id`, `gh auth login` —
-so guide them rather than assuming.
+conda env exists. **No GitHub credentials are needed on Brains** — code reaches
+it by rsync from the laptop. `brains.sh check` confirms connectivity.
+`ssh-copy-id` needs the user's password, so only they can do it.
 
 ## When a task needs a GPU (default behaviour)
 
 GPU/CUDA work does **not** run on this Mac — route it to Brains autonomously:
-1. Ensure the project is set up (`init` once) and current (`deploy` to push
-   code). Connectivity is auto-checked on every command — no manual preflight.
-2. Write the compute script into `pipelines/` (commit + `deploy`).
+1. Ensure the project is set up (`init` once). Connectivity is auto-checked on
+   every command, and **code syncs itself**: every `run`/`bg` mirrors the laptop
+   working tree first, so a remote job never runs stale code.
+2. Write the compute script into `pipelines/`.
 3. **Check GPU availability and claim only what you need** — `brains.sh gpus`,
    then run with `--gpus N` (see the GPU policy below).
 4. `bg` for anything long; `sync-down` results when done.
@@ -71,8 +69,10 @@ A100). Don't guess high "to be safe" — claim the minimum.
    `/data/resource/huggingface` automatically; use `brains.sh hf-ls <model>` to
    see what's already there. New downloads add to the shared cache (never delete
    others' entries).
-5. **Code travels by git; data travels by rsync.** One repo cloned both sides.
-   Never commit `data/`/`results/`. Pull results to local for **all
+5. **The laptop is canonical; Brains is a mirror.** Code is rsynced up before
+   every run (`--delete` keeps it exact); `data/` and `results/` are never sent
+   or deleted. **Never edit code on Brains** — the next run overwrites it. Git is
+   for version control on the laptop only. Pull results to local for **all
    visualisation** — viz happens locally so you can iterate without Brains.
 6. **GPU policy — only completely-free GPUs, never monopolise.** A GPU counts as
    usable **only if nobody has any process on it**; never co-locate with someone
@@ -95,8 +95,8 @@ its root (created by `init`, safe to commit). From your local repo root:
 
 This writes `.brains` (mapping the repo to `/data/<username>/<project-name>`),
 adds gitignore entries for `data/`/`results/`/`.venv/`, scaffolds
-`pipelines/ analysis/ data/ results/`, and on Brains creates the project dir,
-the `/data` caches, and clones the repo (if it has a GitHub `origin`).
+`pipelines/ analysis/ data/ results/`, creates the remote dir and caches, and
+mirrors the code there.
 
 ## Common workflows
 
@@ -107,7 +107,7 @@ the `/data` caches, and clones the repo (if it has a GitHub `origin`).
 | GPU free/busy + who's using them | `brains.sh gpus` |
 | Can I get N free GPUs right now? | `brains.sh gpu-check <n>` |
 | Is a model already cached? | `brains.sh hf-ls <name>` |
-| Sync code to Brains | `brains.sh deploy` (git push + remote pull) |
+| Mirror code to Brains now | `brains.sh deploy` (run/bg do it automatically) |
 | Quick job on 1 GPU | `brains.sh run --gpus 1 -- python pipelines/x.py` |
 | Long job on 2 GPUs (survives disconnect) | `brains.sh bg train --gpus 2 -- python pipelines/train.py` |
 | Use ALL GPUs (only after user approves) | `brains.sh bg big --gpus 4 --allow-all-gpus -- …` |
@@ -154,8 +154,8 @@ You are free to modify the `<your-env>` env as needed. uv/pip caches go to `/dat
   — probe for a free one, don't hardcode. A model may be in the shared cache *or*
   your private one — set `HF_HOME` or pass an explicit `model_path`
   (+`--served-model-name`).
-- **`data/` is not deployed** (code by git, data by rsync) — sync input files
-  (`--match` params, CSVs) separately or a fresh-cloned job won't find them. Your
+- **`data/` is not mirrored** — sync input files (`--match` params, CSVs) with
+  `sync-up`/`put`, or a fresh remote job won't find them. Your
   `<your-env>` env may also lack a dep (`brains.sh install <pkg>` on `ModuleNotFound`).
 - **Orphaned vLLM after a job "finishes":** an asyncio teardown hang can leave a
   server pinning a GPU at 100% util doing nothing, stalling any queue behind it —
@@ -170,15 +170,14 @@ You are free to modify the `<your-env>` env as needed. uv/pip caches go to `/dat
 
 - `reference/architecture.md` — local/remote split, canonical locations, the
   `.brains` config, directory layout, data flow, how each requirement is met.
-- `reference/versioning.md` — the one-repo workflow, code-vs-data, keeping local
-  and Brains in sync, run provenance, the gitignore template.
+- `reference/versioning.md` — the laptop-canonical mirror, code-vs-data, run
+  provenance, the gitignore template.
 - `reference/remote-environment.md` — why the env preamble exists (non-interactive
   SSH skips `.bashrc`), the shared HF cache, cache redirection, GPU usage.
 - `reference/setup.md` — first-run setup + the agent checklist (what to verify and
-  what to request from the user): config, passwordless SSH, conda env, and GitHub
-  credentials (local + on Brains).
+  what to request from the user).
 - `reference/gpu-serving-gotchas.md` — operational gotchas for running/serving models
   on the GPUs: the GPU-selection race, per-model TP=1 serving failures (KV-cache OOM,
   Mamba `max-num-seqs`, MXFP4-vs-transformers), ports/caches on a shared host, `data/`
-  not deployed, orphaned-vLLM detection, ssh-over-VPN timeouts. Read before a non-trivial
+  not mirrored, orphaned-vLLM detection, ssh-over-VPN timeouts. Read before a non-trivial
   serve/run.

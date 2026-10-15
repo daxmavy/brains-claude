@@ -58,11 +58,11 @@ cache that holds the model, **or** pass an explicit `model_path` (with
 re-download). `brains.sh hf-ls <name>` checks the shared cache, which the skill sets as
 `HF_HOME` automatically.
 
-## `data/` is NOT deployed — only code travels by git
-`deploy` pushes **code only** (`data/` and `results/` are gitignored). Any input a
+## `data/` is NOT mirrored — only code is
+The code mirror (`run`/`bg`/`deploy`) sends **code only**; `data/` and `results/` are excluded. Any input a
 remote job reads — a `--match params.json`, a prepared CSV — must be synced
 separately (`sync-up`, `put`, or `scp`). A job that can't find `data/...` right after
-a fresh clone/deploy is almost always this.
+a fresh mirror is almost always this.
 
 ## The shared conda env may lack a project dep
 The `<your-env>` env is shared and may be missing a Python dep your code needs

@@ -6,7 +6,8 @@
 #   * remote env is set explicitly (non-interactive SSH does NOT load ~/.bashrc),
 #     pointing HF at the shared cache and redirecting package caches off /home
 #   * heavy files live under /data/<username>, never the (full) /home
-#   * code moves by git; data moves by rsync
+#   * code is mirrored from the laptop by rsync before every run (no git on Brains)
+#   * a GPU is used only if nobody else has any process on it
 #
 # Project mapping is read from a `.brains` file at the repo root (see `init`).
 # Run `brains.sh help` for the command list.
@@ -54,7 +55,7 @@ need_config() {
 # ---- Canonical remote environment preamble ----
 # Emitted into EVERY remote command. Non-interactive SSH skips ~/.bashrc, so we
 # set this ourselves: shared HF cache (req: check shared cache) + caches moved
-# off the 96%-full /home onto /data (req: heavy files on /data).
+# off the full /home onto /data (req: heavy files on /data).
 remote_env() {
   cat <<EOF
 export HF_HOME='${BRAINS_HF_HOME}'
@@ -149,6 +150,19 @@ resolve_gpus() {  # resolve_gpus <need|""> <want|""> <allow:0|1>
   printf '%s' "$(printf '%s\n' "$report" | sed -n 's/^SELECT=//p' | tail -1)"
 }
 
+# Mirror the laptop working tree to Brains (code only). --delete keeps the mirror
+# exact; data/, results/, .git and .venv are excluded, so they are never sent and
+# never deleted on Brains. Runs automatically before every run/bg.
+mirror_code() {
+  need_config
+  ssh_raw "mkdir -p '$BRAINS_REMOTE_DIR' '$BRAINS_DATA_ROOT/.cache'"
+  info "code -> brains: $BRAINS_PROJECT_ROOT/ -> $BRAINS_REMOTE_DIR/ (excl. .git data results .venv)"
+  do_rsync --delete --exclude .git --exclude /data --exclude /results --exclude .venv \
+    --exclude __pycache__ --exclude .ipynb_checkpoints \
+    "$BRAINS_PROJECT_ROOT/" "${BRAINS_USER}@${BRAINS_HOST}:$BRAINS_REMOTE_DIR/" >/dev/null \
+    || die "code mirror to Brains failed"
+}
+
 # Build the inner runner: env + cd + optional GPU pin + the user command.
 build_runner() {  # build_runner <subdir> <gpu-or-empty> <user-cmd>
   local subdir="$1" gpu="$2" cmd="$3" wd="$BRAINS_REMOTE_DIR"
@@ -226,6 +240,7 @@ cmd_run() {  # run [--dir D] [--gpus N | --gpu LIST] [--allow-all-gpus] [--sync]
     gpu="$(resolve_gpus "$need" "$want" "$allow")" || return $?   # refused -> report shown above
     info "using GPU(s): ${gpu:-none}"
   fi
+  mirror_code
   ssh_script "$(build_runner "$subdir" "$gpu" "$*")"
   local rc=$?
   [[ $sync -eq 1 ]] && cmd_sync_down results
@@ -254,6 +269,12 @@ cmd_bg() {  # bg <name> [--dir D] [--gpu N|auto] -- <cmd...>
     gpu="$(resolve_gpus "$need" "$want" "$allow")" || return $?   # refused -> report shown above
     info "using GPU(s): ${gpu:-none}"
   fi
+  mirror_code
+
+  # provenance: Brains has no .git (code arrives by rsync), so stamp the laptop's git state
+  local sha_local dirty_local
+  sha_local=$(git -C "$BRAINS_PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo NA)
+  dirty_local=$(test -n "$(git -C "$BRAINS_PROJECT_ROOT" status --porcelain 2>/dev/null)" && echo yes || echo no)
 
   local logd="$BRAINS_REMOTE_DIR/results/logs"
   local runner_enc; runner_enc="$(b64 "$(build_runner "$subdir" "$gpu" "$*")")"
@@ -266,8 +287,8 @@ mkdir -p "\$LOGD"
 echo '$runner_enc' | base64 -d > "\$LOGD/\$NAME.run.sh"
 { echo "name: \$NAME";
   echo "started_utc: \$(date -u +%FT%TZ)";
-  echo "git_sha: \$(git -C '$BRAINS_REMOTE_DIR' rev-parse HEAD 2>/dev/null || echo NA)";
-  echo "git_dirty: \$(test -n "\$(git -C '$BRAINS_REMOTE_DIR' status --porcelain 2>/dev/null)" && echo yes || echo no)";
+  echo "git_sha_local: ${sha_local}";
+  echo "git_dirty_local: ${dirty_local}";
   echo "gpu: ${gpu:-default}"; } > "\$LOGD/\$NAME.meta"
 if command -v tmux >/dev/null 2>&1; then
   tmux new-session -d -s "brains_\$NAME" "bash '\$LOGD/\$NAME.run.sh' > '\$LOGD/\$NAME.log' 2>&1"
@@ -321,7 +342,7 @@ cmd_sync_down() {  # sync-down [subdir=results]
 cmd_sync_up() {  # sync-up [subdir=data]
   need_config
   local sub="${1:-data}"
-  info "NOTE: code should travel by git (use 'deploy'); sync-up is for data only."
+  info "NOTE: code is mirrored automatically by run/bg/deploy; sync-up is for data only."
   local local_dir="${BRAINS_PROJECT_ROOT}/${sub}/"
   local remote="${BRAINS_USER}@${BRAINS_HOST}:${BRAINS_REMOTE_DIR}/${sub}/"
   [[ -d "$local_dir" ]] || die "sync-up: local $local_dir does not exist"
@@ -354,12 +375,9 @@ cmd_put() {  # put <local> [remote] — push a single file/dir to Brains (writes
   do_rsync "$lp" "${BRAINS_USER}@${BRAINS_HOST}:$rp"
 }
 
-cmd_deploy() {  # push local commits, then pull them on Brains
-  need_config
-  info "git push (local)…"
-  git -C "$BRAINS_PROJECT_ROOT" push || die "local git push failed"
-  info "git pull (Brains)…"
-  ssh_script "export GIT_TERMINAL_PROMPT=0; cd '$BRAINS_REMOTE_DIR' && git pull --ff-only"
+cmd_deploy() {  # mirror the laptop working tree to Brains now (run/bg do this anyway)
+  mirror_code
+  info "deployed."
 }
 
 cmd_shell() {  # interactive login shell in the project dir
@@ -402,24 +420,12 @@ EOF
   mkdir -p "$root/data" "$root/results" "$root/analysis" "$root/pipelines"
   [[ -f "$root/results/.gitkeep" ]] || : > "$root/results/.gitkeep"
 
-  # 4) remote: preflight, make dirs + caches, clone if a remote exists
-  local url; url="$(git -C "$root" remote get-url origin 2>/dev/null || true)"
-  ssh_script "
-    set -uo pipefail
-    mkdir -p '$remote_dir' '${BRAINS_DATA_ROOT}/.cache'
-    if [[ -n '$url' ]]; then
-      if [[ -d '$remote_dir/.git' ]]; then echo 'remote repo already present'
-      else
-        export GIT_TERMINAL_PROMPT=0
-        git clone '$url' '$remote_dir' && echo 'cloned $url -> $remote_dir' \
-          || echo 'WARN: clone failed (check GitHub credentials on Brains); dir created empty'
-      fi
-    else
-      echo 'no origin remote locally — created $remote_dir but did not clone'
-    fi
-    echo 'remote ready: $remote_dir'"
+  # 4) remote: make the project dir + caches, then mirror the code
+  BRAINS_PROJECT_ROOT="$root"; BRAINS_REMOTE_DIR="$remote_dir"
+  mirror_code
+  info "remote ready: $remote_dir"
   info ""
-  info "Done. Commit .brains + .gitignore, then use: brains.sh deploy / run / bg / sync-down."
+  info "Done. Commit .brains + .gitignore, then use: brains.sh run / bg / sync-down."
 }
 
 cmd_help() {
@@ -435,7 +441,7 @@ Connectivity (no .brains needed):
   install <pkgs...>     uv pip install into the <your-env> conda env (deps live there)
 
 Per-project (needs a .brains file at the repo root):
-  init <name>           scaffold project: write .brains/.gitignore, make /data/<username>/<name>, clone repo
+  init <name>           scaffold project: write .brains/.gitignore, make /data/<username>/<name>, mirror code
   config                show the resolved local<->remote mapping
   run [opts] -- <cmd>   run on Brains (foreground). opts: --dir D  --gpus N | --gpu LIST  --allow-all-gpus  --sync
   bg <name> [opts] -- <cmd>   run detached (tmux), survives disconnect; same --gpus/--gpu/--allow-all-gpus opts
@@ -443,10 +449,10 @@ Per-project (needs a .brains file at the repo root):
   logs <name> [n]       tail a background job's log
   stop <name>           stop a background job
   sync-down [subdir]    rsync remote -> local (default: results/)  ← pull data for local viz
-  sync-up   [subdir]    rsync local -> remote (default: data/)     ← inputs only; code goes via git
+  sync-up   [subdir]    rsync local -> remote (default: data/)     ← inputs only; code is mirrored by run/bg
   get <remote> [local]  fetch one file/dir from Brains (remote rel. to project, or absolute)
   put <local> [remote]  push one file/dir to Brains (only writes under your dirs)
-  deploy                git push (local) then git pull (Brains)    ← the code-sync path
+  deploy                mirror the laptop working tree to Brains now (run/bg do it automatically)
   shell                 interactive login shell in the project dir
 
 Preflight: every remote command auto-checks the VPN + reachability first — silent
@@ -455,10 +461,11 @@ Env: every remote command runs in the `<your-env>` conda env (install deps with 
 which targets it); HF shared cache + /data caches + CUDA_DEVICE_ORDER=PCI_BUS_ID
 (so CUDA indices match nvidia-smi) are all set for you automatically.
 GPU policy: request GPUs with --gpus N (or --gpu LIST). A GPU counts as free ONLY
-if nobody has any process on it — never co-locate. The request is refused if
-fewer than N are free (you get a per-user occupancy report), or if it would take
-ALL GPUs — that needs --allow-all-gpus, only after the user explicitly approves.
-Heavy outputs live under /data/<username>/<name>;
+if nobody has any process on it — never co-locate with someone else's work. The
+request is refused if fewer than N are free (you get a per-user occupancy report),
+or if it would take ALL GPUs — that needs --allow-all-gpus, only after the user
+explicitly approves. Code is never edited on Brains: the laptop tree is mirrored
+before every run. Heavy outputs live under /data/<username>/<name>;
 models reuse the shared HF cache; all visualisation happens locally.
 EOF
 }
